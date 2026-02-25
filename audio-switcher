@@ -1,0 +1,97 @@
+#!/bin/bash
+# audio-switcher — PipeWire auto-routing daemon
+#
+# Monitors sink/source availability via pactl subscribe and dynamically
+# sets audio defaults:
+#   - BTD-800 present → headset as default output + mic
+#   - BTD-800 absent  → S/PDIF speakers as fallback output
+#
+# Designed to run as a systemd user service. See install.sh.
+#
+# Manual run:  ./audio-switcher
+# View logs:   journalctl --user-unit audio-switcher -f
+
+set -euo pipefail
+
+# --- Constants ---
+BTD_SINK="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo"
+BTD_SOURCE="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
+SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
+RECONNECT_DELAY=2
+SETTLE_DELAY=0.5
+
+# --- Logging ---
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): $*"
+}
+
+# --- Core Logic ---
+apply_defaults() {
+    local current_sink current_source
+
+    # Determine correct default sink
+    if pactl list sinks short 2>/dev/null | grep -q "$BTD_SINK"; then
+        # BTD-800 present → headset
+        current_sink=$(pactl get-default-sink 2>/dev/null || true)
+        if [[ "$current_sink" != "$BTD_SINK" ]]; then
+            pactl set-default-sink "$BTD_SINK"
+            log "Default sink → BTD-800 headset"
+        fi
+    else
+        # BTD-800 absent → S/PDIF fallback
+        current_sink=$(pactl get-default-sink 2>/dev/null || true)
+        if [[ "$current_sink" != "$SPDIF_SINK" ]]; then
+            pactl set-default-sink "$SPDIF_SINK"
+            log "Default sink → S/PDIF speakers (BTD-800 absent)"
+        fi
+    fi
+
+    # Determine correct default source (only set if BTD-800 mic present)
+    if pactl list sources short 2>/dev/null | grep -q "$BTD_SOURCE"; then
+        current_source=$(pactl get-default-source 2>/dev/null || true)
+        if [[ "$current_source" != "$BTD_SOURCE" ]]; then
+            pactl set-default-source "$BTD_SOURCE"
+            log "Default source → BTD-800 mic"
+        fi
+    fi
+    # No explicit fallback source — let PipeWire choose when BTD-800 mic absent
+}
+
+# --- Event Loop ---
+subscribe_loop() {
+    while true; do
+        log "Connecting to PipeWire via pactl subscribe..."
+        apply_defaults
+
+        # Read pactl subscribe output; exits when PipeWire restarts
+        local last_event_time=0
+        while IFS= read -r line; do
+            # Filter for sink/source events
+            if [[ "$line" == *"sink"* || "$line" == *"source"* ]]; then
+                local now
+                now=$(date +%s%N 2>/dev/null || date +%s)
+                # Settle delay: batch rapid events
+                sleep "$SETTLE_DELAY"
+                apply_defaults
+            fi
+        done < <(pactl subscribe 2>&1)
+
+        # pactl subscribe exited — PipeWire probably restarted
+        log "pactl subscribe disconnected, waiting ${RECONNECT_DELAY}s before reconnecting..."
+        sleep "$RECONNECT_DELAY"
+    done
+}
+
+# --- Signal Handling ---
+cleanup() {
+    log "Shutting down audio-switcher"
+    # Kill any child processes (pactl subscribe)
+    kill -- -$$ 2>/dev/null || true
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# --- Main ---
+log "audio-switcher starting"
+subscribe_loop
