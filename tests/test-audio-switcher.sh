@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DAEMON="$PROJECT_DIR/audio-switcher"
 INSTALL_SCRIPT="$PROJECT_DIR/install.sh"
+UNINSTALL_SCRIPT="$PROJECT_DIR/uninstall.sh"
 
 PASS=0
 FAIL=0
@@ -84,11 +85,59 @@ else
     test_result "apply_defaults() function defined" "fail"
 fi
 
-# Has subscribe_loop function
-if grep -q 'subscribe_loop()' "$DAEMON" 2>/dev/null; then
-    test_result "subscribe_loop() function defined" "pass"
+# Has HID detection functions
+for func in event_loop monitor_hidraw find_hidraw; do
+    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
+        test_result "${func}() function defined" "pass"
+    else
+        test_result "${func}() function defined" "fail"
+    fi
+done
+
+# Has HID report constants
+if grep -q 'BTD_HID_REPORT_ID=' "$DAEMON" 2>/dev/null; then
+    test_result "BTD_HID_REPORT_ID constant present" "pass"
 else
-    test_result "subscribe_loop() function defined" "fail"
+    test_result "BTD_HID_REPORT_ID constant present" "fail"
+fi
+
+if grep -q 'BTD_HID_CONNECT_BYTE=' "$DAEMON" 2>/dev/null; then
+    test_result "BTD_HID_CONNECT_BYTE constant present" "pass"
+else
+    test_result "BTD_HID_CONNECT_BYTE constant present" "fail"
+fi
+
+# Has PipeWire recovery functions
+for func in check_pipewire_health pipewire_health_loop; do
+    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
+        test_result "${func}() function defined" "pass"
+    else
+        test_result "${func}() function defined" "fail"
+    fi
+done
+
+# Has PipeWire recovery constants
+for const in PW_ERROR_THRESHOLD PW_COOLDOWN_SECONDS; do
+    if grep -q "${const}=" "$DAEMON" 2>/dev/null; then
+        test_result "${const} constant present" "pass"
+    else
+        test_result "${const} constant present" "fail"
+    fi
+done
+
+# Has state file IPC
+for func in write_state read_state; do
+    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
+        test_result "${func}() function defined" "pass"
+    else
+        test_result "${func}() function defined" "fail"
+    fi
+done
+
+if grep -q 'STATE_FILE=' "$DAEMON" 2>/dev/null; then
+    test_result "STATE_FILE constant present" "pass"
+else
+    test_result "STATE_FILE constant present" "fail"
 fi
 
 # Has signal handling (trap)
@@ -96,13 +145,6 @@ if grep -q 'trap' "$DAEMON" 2>/dev/null; then
     test_result "signal handling (trap) present" "pass"
 else
     test_result "signal handling (trap) present" "fail"
-fi
-
-# Uses pactl subscribe
-if grep -q 'pactl subscribe' "$DAEMON" 2>/dev/null; then
-    test_result "uses pactl subscribe for event monitoring" "pass"
-else
-    test_result "uses pactl subscribe for event monitoring" "fail"
 fi
 
 # install.sh exists and is executable
@@ -117,6 +159,13 @@ if grep -q '\-\-uninstall' "$INSTALL_SCRIPT" 2>/dev/null; then
     test_result "install.sh supports --uninstall" "pass"
 else
     test_result "install.sh supports --uninstall" "fail"
+fi
+
+# uninstall.sh exists and is executable
+if [[ -f "$UNINSTALL_SCRIPT" && -x "$UNINSTALL_SCRIPT" ]]; then
+    test_result "uninstall.sh exists and is executable" "pass"
+else
+    test_result "uninstall.sh exists and is executable" "fail"
 fi
 
 echo ""

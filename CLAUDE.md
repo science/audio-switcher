@@ -2,22 +2,46 @@
 
 ## What This Is
 
-A PipeWire auto-routing daemon for Linux. Monitors sink/source availability via `pactl subscribe` and dynamically sets audio defaults:
-- When Sennheiser BTD-800 USB dongle sink is available, default output to headset
-- When BTD-800 sink disappears, fall back to S/PDIF speakers
-- Microphone always defaults to BTD-800 when present
+A PipeWire auto-routing and recovery daemon for Linux. Two jobs:
+
+1. **HID-based headset detection** — Reads vendor HID reports from the Sennheiser BTD-800 USB dongle's hidraw device to detect headset connect/disconnect, then sets PipeWire audio defaults accordingly.
+2. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults based on current headset state.
 
 ## Architecture
 
-### Event Loop
+### Event Flow
 
 ```
-pactl subscribe → parse sink/source events → apply_defaults()
-   ↑                                              ↓
-   └── reconnect on PipeWire restart ←── pactl set-default-sink/source
+find_hidraw() → monitor_hidraw() → event_loop()
+                    ↓                    ↓
+              python3 HID reader    write_state() → STATE_FILE
+                    ↓                    ↓
+              stdout: connected/    apply_defaults()
+                      disconnected       ↓
+                                    pactl set-default-sink/source
+
+pipewire_health_loop() (background)
+        ↓
+  check_pipewire_health()
+        ↓
+  journalctl broken-pipe count ≥ PW_ERROR_THRESHOLD?
+        ↓ yes
+  systemctl restart pipewire pipewire-pulse wireplumber
+        ↓
+  read_state() → apply_defaults(connected|disconnected)
 ```
 
-The daemon runs `pactl subscribe` via process substitution. When PipeWire restarts (connection breaks), it waits and reconnects. A settle delay batches rapid events.
+### HID Detection
+
+The BTD-800 USB dongle handles Bluetooth internally — PipeWire/ALSA never see connection events. The dongle's HID interface sends vendor reports (Report ID 1) on connect/disconnect. Byte 19 is the connection flag: `0x01` = connected, `0x00` = disconnected.
+
+`monitor_hidraw()` uses an embedded Python helper for binary HID report parsing (bash can't do binary I/O). It outputs `connected` or `disconnected` lines on stdout, consumed by `event_loop()`.
+
+### State File IPC
+
+Background subshells in bash can't share variables. The state file (`$XDG_RUNTIME_DIR/audio-switcher-state`) bridges the HID event loop and health check loop:
+- `write_state "connected"` / `write_state "disconnected"` — written by `event_loop()` on each HID event
+- `read_state` — read by `check_pipewire_health()` to know which defaults to re-apply after a PipeWire restart
 
 ### Audio Device Constants
 
@@ -27,28 +51,47 @@ The daemon runs `pactl subscribe` via process substitution. When PipeWire restar
 | BTD-800 source (headset mic) | `alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback` |
 | S/PDIF fallback sink (speakers) | `alsa_output.pci-0000_00_1f.3.iec958-stereo` |
 
+### PipeWire Recovery Constants
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `PW_ERROR_THRESHOLD` | 5 | Broken-pipe errors needed to trigger restart |
+| `PW_CHECK_WINDOW` | 30s | How far back to look in journalctl |
+| `PW_COOLDOWN_SECONDS` | 300 | Minimum seconds between restarts (5 min) |
+
 ### Key Functions
 
-- **`apply_defaults()`** — Checks sink/source presence, sets defaults only if change needed
-- **`subscribe_loop()`** — Outer reconnect loop wrapping `pactl subscribe` event parsing
-- **Signal handling** — Traps SIGTERM/SIGINT, kills child processes on shutdown
+| Function | Purpose |
+|----------|---------|
+| `find_hidraw()` | Scan /dev/hidraw* for BTD-800 by USB vendor:product ID |
+| `monitor_hidraw()` | Read HID reports via embedded Python, emit connected/disconnected |
+| `event_loop()` | Main loop: read monitor output, write state, apply defaults |
+| `apply_defaults()` | Set PipeWire default sink/source based on connected/disconnected |
+| `write_state()` / `read_state()` | State file IPC between event loop and health check |
+| `check_pipewire_health()` | Count broken-pipe errors, restart PipeWire if threshold met, re-apply defaults |
+| `pipewire_health_loop()` | Background loop: sleep 30, check health, repeat |
+| `cleanup()` | Signal handler: kill background jobs, remove runtime files |
 
 ## Development Rules
 
 1. **TDD: Red -> Green -> Refactor** — Write or update tests FIRST, verify they fail, then implement. Every change must include tests.
 2. **Run tests after every change** — `./tests/test-audio-switcher.sh`. Non-negotiable.
-3. **Keep it bash-simple** — Pure bash daemon, no external dependencies beyond `pactl` and standard coreutils.
-4. **Don't break the event loop** — The subscribe loop must handle PipeWire restarts gracefully. No unhandled failures.
-5. **Log sparingly** — Log routing changes and errors. Don't log every event in production.
+3. **Keep it bash-simple** — Pure bash daemon (with embedded Python for binary HID parsing). No external dependencies beyond `pactl`, `journalctl`, `systemctl`, `python3`, and standard coreutils.
+4. **Don't break the event loop** — The HID monitor must handle device disconnects gracefully. No unhandled failures.
+5. **Log sparingly** — Log routing changes, PipeWire restarts, and errors. Don't log every poll cycle.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `audio-switcher` | Main daemon (bash) — pactl subscribe event loop |
-| `install.sh` | Install/uninstall systemd user service |
-| `tests/test-audio-switcher.sh` | Test suite (static + runtime) |
+| `audio-switcher` | Main daemon (bash) — HID event loop + PipeWire health monitor |
+| `install.sh` | Install/uninstall systemd user service + udev rule |
+| `uninstall.sh` | Convenience wrapper for `install.sh --uninstall` |
+| `tests/test-audio-switcher.sh` | Test suite (static + installation + runtime) |
+| `70-btd800.rules` | udev rule granting user access to BTD-800 hidraw device |
+| `diag-btd800.sh` | Diagnostic: raw HID report monitor (run with sudo) |
 | `CLAUDE.md` | This file — project rules for AI |
+| `README.md` | User-facing documentation |
 | `PLAN.md` | Original design document |
 
 ## Testing Approach
@@ -63,9 +106,16 @@ fi
 ```
 
 Three categories:
-- **Static checks** — Script exists, executable, has expected constants, correct shebang
-- **Installation checks** — Service file exists, enabled, active
-- **Runtime checks** — Default sink matches BTD-800 presence, daemon responds to events
+- **Static checks** — Script exists, executable, shebang, constants, functions (HID + recovery + state)
+- **Installation checks** — Binary installed, service file exists, enabled, active
+- **Runtime checks** — Default sink/source matches BTD-800 presence
+
+### TDD Workflow
+1. Add test to `tests/test-audio-switcher.sh` for the new behavior
+2. Run tests — new test should fail
+3. Implement the change
+4. Run tests — all should pass
+5. Commit both test and implementation together
 
 ## Common Tasks
 
@@ -76,13 +126,18 @@ Three categories:
 
 ### Run manually
 ```bash
-./audio-switcher
+./audio-switcher [-v|--verbose]
 ```
 
 ### Install as systemd user service
 ```bash
-./install.sh                  # install + enable + start
-./install.sh --uninstall      # stop + disable + remove
+./install.sh
+```
+
+### Uninstall
+```bash
+./uninstall.sh
+# or: ./install.sh --uninstall
 ```
 
 ### Check logs
@@ -90,8 +145,7 @@ Three categories:
 journalctl --user-unit audio-switcher -f
 ```
 
-### Restart after PipeWire changes
-The daemon auto-reconnects. To force restart:
+### Diagnostics (raw HID monitoring)
 ```bash
-systemctl --user restart audio-switcher
+sudo ./diag-btd800.sh
 ```

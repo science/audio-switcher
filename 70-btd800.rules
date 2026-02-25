@@ -1,0 +1,5 @@
+# Grant logged-in user read access to BTD-800 USB dongle HID interface.
+# Required for audio-switcher to detect headset connection via hidraw.
+# Install: sudo cp 70-btd800.rules /etc/udev/rules.d/
+# Reload: sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1395", ATTRS{idProduct}=="002d", TAG+="uaccess"

@@ -1,15 +1,18 @@
 #!/bin/bash
 # audio-switcher — PipeWire auto-routing daemon
 #
-# Monitors sink/source availability via pactl subscribe and dynamically
-# sets audio defaults:
-#   - BTD-800 present → headset as default output + mic
-#   - BTD-800 absent  → S/PDIF speakers as fallback output
+# Detects Sennheiser BTD-800 headset connection via HID reports from
+# the USB dongle's hidraw device, then sets PipeWire audio defaults:
+#   - Headset connected  → BTD-800 as default sink + source
+#   - Headset disconnected → S/PDIF speakers as default sink
 #
-# Designed to run as a systemd user service. See install.sh.
+# The BTD-800 dongle handles Bluetooth internally. PipeWire/ALSA never
+# see connection events. The dongle's HID interface (Report ID 1) sends
+# a vendor report on connect/disconnect. Byte 19 is the connection flag:
+#   0x01 = connected, 0x00 = disconnected.
 #
-# Manual run:  ./audio-switcher
-# View logs:   journalctl --user-unit audio-switcher -f
+# Run interactively:  ./audio-switcher [-v|--verbose]
+# Install as service: ./install.sh
 
 set -euo pipefail
 
@@ -17,81 +20,288 @@ set -euo pipefail
 BTD_SINK="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo"
 BTD_SOURCE="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
 SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
-RECONNECT_DELAY=2
-SETTLE_DELAY=0.5
+
+# HID report parsing: vendor report ID 1, byte 19 = connection flag
+BTD_HID_REPORT_ID=1
+BTD_HID_CONNECT_BYTE=19  # 0-indexed within full report (including report ID byte)
+
+# PipeWire recovery: detect broken-pipe errors and restart PipeWire
+PW_ERROR_THRESHOLD=5         # broken-pipe errors in check window to trigger restart
+PW_CHECK_WINDOW="30s"        # how far back to look in the journal
+PW_COOLDOWN_SECONDS=300      # minimum seconds between restarts (5 minutes)
+PW_COOLDOWN_FILE="${XDG_RUNTIME_DIR}/audio-switcher-pw-cooldown"
+
+# State file: IPC between HID event loop and health check loop
+# (background subshells can't share variables — state file is simplest IPC)
+STATE_FILE="${XDG_RUNTIME_DIR}/audio-switcher-state"
+
+# Delays
+SETTLE_DELAY=0.3
+
+VERBOSE=false
+if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
+    VERBOSE=true
+fi
 
 # --- Logging ---
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S'): $*"
+    echo "$(date '+%H:%M:%S'): $*"
+}
+
+debug() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "$(date '+%H:%M:%S'): [debug] $*"
+    fi
+}
+
+# --- Find BTD-800 hidraw device ---
+find_hidraw() {
+    local hidraw
+    for hidraw in /dev/hidraw*; do
+        [[ -e "$hidraw" ]] || continue
+        local vid pid
+        # Walk sysfs to match vendor/product
+        local sysdev="/sys/class/hidraw/$(basename "$hidraw")/device"
+        if [[ -d "$sysdev" ]]; then
+            # Try to find idVendor/idProduct in parent USB device
+            vid=$(cat "$sysdev/../../idVendor" 2>/dev/null || true)
+            pid=$(cat "$sysdev/../../idProduct" 2>/dev/null || true)
+            if [[ "$vid" == "1395" && "$pid" == "002d" ]]; then
+                echo "$hidraw"
+                return 0
+            fi
+        fi
+    done
+    return 1
 }
 
 # --- Core Logic ---
 apply_defaults() {
+    local connected="$1"
     local current_sink current_source
 
-    # Determine correct default sink
-    if pactl list sinks short 2>/dev/null | grep -q "$BTD_SINK"; then
-        # BTD-800 present → headset
-        current_sink=$(pactl get-default-sink 2>/dev/null || true)
+    current_sink=$(pactl get-default-sink 2>/dev/null || true)
+    current_source=$(pactl get-default-source 2>/dev/null || true)
+
+    if [[ "$connected" == "true" ]]; then
+        # Headset connected → BTD-800
         if [[ "$current_sink" != "$BTD_SINK" ]]; then
-            pactl set-default-sink "$BTD_SINK"
-            log "Default sink → BTD-800 headset"
+            if pactl set-default-sink "$BTD_SINK" 2>/dev/null; then
+                log "SWITCH sink → BTD-800 headset"
+            else
+                log "ERROR: failed to set BTD-800 as default sink"
+            fi
+        else
+            debug "sink already BTD-800, no change"
+        fi
+        # Set mic
+        if [[ "$current_source" != "$BTD_SOURCE" ]]; then
+            if pactl set-default-source "$BTD_SOURCE" 2>/dev/null; then
+                log "SWITCH source → BTD-800 mic"
+            else
+                log "ERROR: failed to set BTD-800 as default source"
+            fi
+        else
+            debug "source already BTD-800, no change"
         fi
     else
-        # BTD-800 absent → S/PDIF fallback
-        current_sink=$(pactl get-default-sink 2>/dev/null || true)
+        # Headset disconnected → S/PDIF fallback
         if [[ "$current_sink" != "$SPDIF_SINK" ]]; then
-            pactl set-default-sink "$SPDIF_SINK"
-            log "Default sink → S/PDIF speakers (BTD-800 absent)"
+            if pactl set-default-sink "$SPDIF_SINK" 2>/dev/null; then
+                log "SWITCH sink → S/PDIF speakers"
+            else
+                log "ERROR: failed to set S/PDIF as default sink"
+            fi
+        else
+            debug "sink already S/PDIF, no change"
         fi
+        # No explicit fallback source — let PipeWire choose
     fi
-
-    # Determine correct default source (only set if BTD-800 mic present)
-    if pactl list sources short 2>/dev/null | grep -q "$BTD_SOURCE"; then
-        current_source=$(pactl get-default-source 2>/dev/null || true)
-        if [[ "$current_source" != "$BTD_SOURCE" ]]; then
-            pactl set-default-source "$BTD_SOURCE"
-            log "Default source → BTD-800 mic"
-        fi
-    fi
-    # No explicit fallback source — let PipeWire choose when BTD-800 mic absent
 }
 
-# --- Event Loop ---
-subscribe_loop() {
+show_status() {
+    local default_sink default_source
+    default_sink=$(pactl get-default-sink 2>/dev/null || echo "(unknown)")
+    default_source=$(pactl get-default-source 2>/dev/null || echo "(unknown)")
+    log "  Default sink:   $default_sink"
+    log "  Default source: $default_source"
+}
+
+# --- State File IPC ---
+write_state() {
+    echo "$1" > "$STATE_FILE"
+}
+
+read_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        cat "$STATE_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+# --- PipeWire Health Monitor ---
+check_pipewire_health() {
+    # Check cooldown — don't restart too frequently
+    if [[ -f "$PW_COOLDOWN_FILE" ]]; then
+        local last_restart now
+        last_restart=$(cat "$PW_COOLDOWN_FILE")
+        now=$(date +%s)
+        if (( now - last_restart < PW_COOLDOWN_SECONDS )); then
+            return 0
+        fi
+    fi
+
+    # Count broken-pipe errors in the check window
+    local error_count
+    error_count=$(journalctl --user -u pipewire --since "-${PW_CHECK_WINDOW}" --no-pager 2>/dev/null \
+        | grep -c "Broken pipe" || true)
+
+    if (( error_count >= PW_ERROR_THRESHOLD )); then
+        log "PW-RECOVERY: $error_count broken-pipe errors in last ${PW_CHECK_WINDOW}, restarting PipeWire"
+        systemctl --user restart pipewire pipewire-pulse wireplumber
+
+        # Record restart time for cooldown
+        date +%s > "$PW_COOLDOWN_FILE"
+
+        # Give PipeWire time to enumerate devices, then re-apply correct defaults
+        sleep 2
+        local state
+        state=$(read_state)
+        if [[ "$state" == "connected" ]]; then
+            apply_defaults true
+        else
+            apply_defaults false
+        fi
+        log "PW-RECOVERY: defaults re-applied (state=$state)"
+        show_status
+    fi
+}
+
+pipewire_health_loop() {
     while true; do
-        log "Connecting to PipeWire via pactl subscribe..."
-        apply_defaults
+        sleep 30
+        check_pipewire_health || true
+    done
+}
 
-        # Read pactl subscribe output; exits when PipeWire restarts
-        local last_event_time=0
-        while IFS= read -r line; do
-            # Filter for sink/source events
-            if [[ "$line" == *"sink"* || "$line" == *"source"* ]]; then
-                local now
-                now=$(date +%s%N 2>/dev/null || date +%s)
-                # Settle delay: batch rapid events
-                sleep "$SETTLE_DELAY"
-                apply_defaults
-            fi
-        done < <(pactl subscribe 2>&1)
+# --- HID Monitor ---
+# Reads BTD-800 hidraw device and calls apply_defaults on connection changes.
+# Uses a small Python helper for binary HID report parsing.
+monitor_hidraw() {
+    local hidraw="$1"
+    python3 -u -c "
+import os, select, sys
 
-        # pactl subscribe exited — PipeWire probably restarted
-        log "pactl subscribe disconnected, waiting ${RECONNECT_DELAY}s before reconnecting..."
-        sleep "$RECONNECT_DELAY"
+REPORT_ID = $BTD_HID_REPORT_ID
+CONNECT_BYTE = $BTD_HID_CONNECT_BYTE
+
+fd = os.open('$hidraw', os.O_RDONLY)
+try:
+    while True:
+        r, _, _ = select.select([fd], [], [])
+        if r:
+            data = os.read(fd, 256)
+            if not data:
+                break
+            report_id = data[0]
+            if report_id == REPORT_ID and len(data) > CONNECT_BYTE:
+                connected = data[CONNECT_BYTE]
+                # Output: 'connected' or 'disconnected'
+                if connected:
+                    print('connected', flush=True)
+                else:
+                    print('disconnected', flush=True)
+except Exception as e:
+    print(f'error:{e}', file=sys.stderr, flush=True)
+finally:
+    os.close(fd)
+" 2>&1
+}
+
+# --- Main Event Loop ---
+event_loop() {
+    local hidraw="$1"
+
+    while true; do
+        log "Starting HID monitor on $hidraw..."
+        show_status
+
+        while IFS= read -r event; do
+            case "$event" in
+                connected)
+                    log "EVENT: headset connected"
+                    sleep "$SETTLE_DELAY"
+                    write_state "connected"
+                    apply_defaults true
+                    show_status
+                    ;;
+                disconnected)
+                    log "EVENT: headset disconnected"
+                    sleep "$SETTLE_DELAY"
+                    write_state "disconnected"
+                    apply_defaults false
+                    show_status
+                    ;;
+                error:*)
+                    log "HID error: ${event#error:}"
+                    ;;
+                *)
+                    debug "unknown event: $event"
+                    ;;
+            esac
+        done < <(monitor_hidraw "$hidraw")
+
+        # monitor_hidraw exited — device may have been unplugged
+        log "HID monitor disconnected, waiting 2s before retrying..."
+        sleep 2
     done
 }
 
 # --- Signal Handling ---
 cleanup() {
+    trap - SIGTERM SIGINT
+    echo ""
     log "Shutting down audio-switcher"
-    # Kill any child processes (pactl subscribe)
-    kill -- -$$ 2>/dev/null || true
+    # Kill health loop and any other background jobs
+    if [[ -n "${HEALTH_PID:-}" ]]; then
+        kill "$HEALTH_PID" 2>/dev/null || true
+    fi
+    jobs -p | xargs -r kill 2>/dev/null || true
+    # Clean up runtime files
+    rm -f "$STATE_FILE" "$PW_COOLDOWN_FILE"
     exit 0
 }
 
 trap cleanup SIGTERM SIGINT
 
 # --- Main ---
-log "audio-switcher starting"
-subscribe_loop
+log "audio-switcher starting (verbose=$VERBOSE)"
+log "  BTD-800 sink:    $BTD_SINK"
+log "  BTD-800 source:  $BTD_SOURCE"
+log "  S/PDIF fallback: $SPDIF_SINK"
+
+# Find the hidraw device
+HIDRAW=$(find_hidraw) || {
+    log "ERROR: BTD-800 hidraw device not found. Is the dongle plugged in?"
+    log "  Ensure a udev rule grants access: see install.sh"
+    exit 1
+}
+log "  HID device:      $HIDRAW"
+
+# Check read access
+if [[ ! -r "$HIDRAW" ]]; then
+    log "ERROR: Cannot read $HIDRAW (permission denied)"
+    log "  Install the udev rule: sudo cp 70-btd800.rules /etc/udev/rules.d/"
+    log "  Then: sudo udevadm control --reload-rules && sudo udevadm trigger"
+    exit 1
+fi
+
+echo ""
+
+# Start PipeWire health monitor in background
+pipewire_health_loop &
+HEALTH_PID=$!
+log "  PW health monitor PID: $HEALTH_PID"
+
+event_loop "$HIDRAW"

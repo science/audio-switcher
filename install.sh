@@ -4,6 +4,7 @@ set -euo pipefail
 INSTALL_BIN="$HOME/.local/bin/audio-switcher"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/audio-switcher.service"
+UDEV_RULE="/etc/udev/rules.d/70-btd800.rules"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
@@ -16,6 +17,17 @@ usage() {
 do_install() {
     echo "Installing audio-switcher..."
 
+    # Install udev rule for hidraw access (needs sudo)
+    if [[ ! -f "$UDEV_RULE" ]]; then
+        echo "  Installing udev rule for BTD-800 hidraw access (requires sudo)..."
+        sudo cp "$SCRIPT_DIR/70-btd800.rules" "$UDEV_RULE"
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger
+        echo "  Installed $UDEV_RULE"
+    else
+        echo "  udev rule already installed"
+    fi
+
     # Install binary
     mkdir -p "$(dirname "$INSTALL_BIN")"
     cp "$SCRIPT_DIR/audio-switcher" "$INSTALL_BIN"
@@ -26,15 +38,14 @@ do_install() {
     mkdir -p "$SERVICE_DIR"
     cat > "$SERVICE_FILE" <<UNIT
 [Unit]
-Description=Audio switcher: PipeWire auto-routing daemon
+Description=Audio switcher + PipeWire recovery daemon
 After=pipewire-pulse.service
-Requires=pipewire-pulse.service
 
 [Service]
 Type=simple
 ExecStart=$INSTALL_BIN
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=default.target
@@ -74,6 +85,13 @@ do_uninstall() {
     if [[ -f "$INSTALL_BIN" ]]; then
         rm "$INSTALL_BIN"
         echo "  Removed $INSTALL_BIN"
+    fi
+
+    if [[ -f "$UDEV_RULE" ]]; then
+        echo "  Removing udev rule (requires sudo)..."
+        sudo rm "$UDEV_RULE"
+        sudo udevadm control --reload-rules
+        echo "  Removed $UDEV_RULE"
     fi
 
     echo ""
