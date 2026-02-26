@@ -216,49 +216,39 @@ else
     test_result "pactl is available" "fail"
 fi
 
-# Check default sink matches BTD-800 presence
+# Check defaults match headset connection state (via daemon state file)
 BTD_SINK="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo"
+BTD_SOURCE="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
 SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
+STATE_FILE="${XDG_RUNTIME_DIR}/audio-switcher-state"
 
-btd_present=false
-if pactl list sinks short 2>/dev/null | grep -q "$BTD_SINK"; then
-    btd_present=true
+headset_connected=false
+if [[ -f "$STATE_FILE" ]] && [[ "$(cat "$STATE_FILE")" == "connected" ]]; then
+    headset_connected=true
 fi
 
 current_default=$(pactl get-default-sink 2>/dev/null || true)
+current_default_source=$(pactl get-default-source 2>/dev/null || true)
 
-if [[ "$btd_present" == "true" ]]; then
+if [[ "$headset_connected" == "true" ]]; then
     if [[ "$current_default" == "$BTD_SINK" ]]; then
-        test_result "default sink is BTD-800 (headset present)" "pass"
+        test_result "default sink is BTD-800 (headset connected)" "pass"
     else
-        test_result "default sink is BTD-800 (headset present, got: $current_default)" "fail"
+        test_result "default sink is BTD-800 (headset connected, got: $current_default)" "fail"
+    fi
+    if [[ "$current_default_source" == "$BTD_SOURCE" ]]; then
+        test_result "default source is BTD-800 mic (headset connected)" "pass"
+    else
+        test_result "default source is BTD-800 mic (headset connected, got: $current_default_source)" "fail"
     fi
 else
     if [[ "$current_default" == "$SPDIF_SINK" ]]; then
-        test_result "default sink is S/PDIF (headset absent)" "pass"
+        test_result "default sink is S/PDIF (headset disconnected)" "pass"
     else
-        test_result "default sink is S/PDIF (headset absent, got: $current_default)" "fail"
+        test_result "default sink is S/PDIF (headset disconnected, got: $current_default)" "fail"
     fi
-fi
-
-# Check default source matches BTD-800 presence (when BTD-800 present)
-BTD_SOURCE="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
-
-btd_source_present=false
-if pactl list sources short 2>/dev/null | grep -q "$BTD_SOURCE"; then
-    btd_source_present=true
-fi
-
-current_default_source=$(pactl get-default-source 2>/dev/null || true)
-
-if [[ "$btd_source_present" == "true" ]]; then
-    if [[ "$current_default_source" == "$BTD_SOURCE" ]]; then
-        test_result "default source is BTD-800 mic (present)" "pass"
-    else
-        test_result "default source is BTD-800 mic (present, got: $current_default_source)" "fail"
-    fi
-else
-    test_result "BTD-800 source not present — skipping source check" "pass"
+    # No expected source when headset disconnected — PipeWire chooses
+    test_result "headset disconnected — source check skipped (PipeWire chooses)" "pass"
 fi
 
 echo ""
