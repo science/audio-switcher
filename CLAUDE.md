@@ -16,11 +16,15 @@ find_hidraw() → monitor_hidraw() → event_loop()
                     ↓                    ↓
               python3 HID reader    write_state() → STATE_FILE
                     ↓                    ↓
-              stdout: connected/    apply_defaults()
+              stdout: connected/    apply_defaults()  ← find_btd_sink()/find_btd_source()
                       disconnected       ↓
                                     pactl set-default-sink/source
+                                         ↓ (on connect)
+                                    rapid_health_check() (background, ~30s)
+                                         ↓
+                                    any broken pipe? → restart PipeWire → re-apply
 
-pipewire_health_loop() (background)
+pipewire_health_loop() (background, every 30s)
         ↓
   check_pipewire_health()
         ↓
@@ -45,11 +49,12 @@ Background subshells in bash can't share variables. The state file (`$XDG_RUNTIM
 
 ### Audio Device Constants
 
-| Device | PipeWire Name |
-|--------|---------------|
-| BTD-800 sink (headset output) | `alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo` |
-| BTD-800 source (headset mic) | `alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback` |
-| S/PDIF fallback sink (speakers) | `alsa_output.pci-0000_00_1f.3.iec958-stereo` |
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `BTD_USB_ID` | `usb-1395_Sennheiser_BTD_800_USB-00` | Match pattern for BTD-800 sink/source (stable across profile changes) |
+| `SPDIF_SINK` | `alsa_output.pci-0000_00_1f.3.iec958-stereo` | Motherboard S/PDIF (stable) |
+
+BTD-800 sink and source names are **discovered at runtime** via `find_btd_sink()` / `find_btd_source()`. The actual PipeWire name depends on which profile is active (e.g. `analog-stereo` or `iec958-stereo`).
 
 ### PipeWire Recovery Constants
 
@@ -64,12 +69,15 @@ Background subshells in bash can't share variables. The state file (`$XDG_RUNTIM
 | Function | Purpose |
 |----------|---------|
 | `find_hidraw()` | Scan /dev/hidraw* for BTD-800 by USB vendor:product ID |
+| `find_btd_sink()` | Discover BTD-800 sink name from PipeWire (matches `BTD_USB_ID` pattern) |
+| `find_btd_source()` | Discover BTD-800 source name from PipeWire (excludes `.monitor`) |
 | `monitor_hidraw()` | Read HID reports via embedded Python, emit connected/disconnected |
-| `event_loop()` | Main loop: read monitor output, write state, apply defaults |
-| `apply_defaults()` | Set PipeWire default sink/source based on connected/disconnected |
+| `event_loop()` | Main loop: read monitor output, write state, apply defaults, spawn rapid checks |
+| `apply_defaults()` | Discover + set PipeWire default sink/source based on connected/disconnected |
 | `write_state()` / `read_state()` | State file IPC between event loop and health check |
 | `check_pipewire_health()` | Count broken-pipe errors, restart PipeWire if threshold met, re-apply defaults |
 | `pipewire_health_loop()` | Background loop: sleep 30, check health, repeat |
+| `rapid_health_check()` | Post-connect rapid checks (~10x at 3s intervals, threshold=1 broken pipe) |
 | `cleanup()` | Signal handler: kill background jobs, remove runtime files |
 
 ## Development Rules

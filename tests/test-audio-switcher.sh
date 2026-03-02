@@ -57,18 +57,24 @@ else
     test_result "audio-switcher uses strict mode (set -euo pipefail)" "fail"
 fi
 
-# BTD-800 sink constant
-if grep -q 'alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo' "$DAEMON" 2>/dev/null; then
-    test_result "BTD-800 sink constant present" "pass"
+# BTD_USB_ID pattern constant
+if grep -q 'BTD_USB_ID=.*usb-1395_Sennheiser_BTD_800_USB-00' "$DAEMON" 2>/dev/null; then
+    test_result "BTD_USB_ID pattern constant present" "pass"
 else
-    test_result "BTD-800 sink constant present" "fail"
+    test_result "BTD_USB_ID pattern constant present" "fail"
 fi
 
-# BTD-800 source constant
-if grep -q 'alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback' "$DAEMON" 2>/dev/null; then
-    test_result "BTD-800 source constant present" "pass"
+# Dynamic discovery functions
+if grep -q 'find_btd_sink()' "$DAEMON" 2>/dev/null; then
+    test_result "find_btd_sink() function defined" "pass"
 else
-    test_result "BTD-800 source constant present" "fail"
+    test_result "find_btd_sink() function defined" "fail"
+fi
+
+if grep -q 'find_btd_source()' "$DAEMON" 2>/dev/null; then
+    test_result "find_btd_source() function defined" "pass"
+else
+    test_result "find_btd_source() function defined" "fail"
 fi
 
 # S/PDIF fallback sink constant
@@ -138,6 +144,34 @@ if grep -q 'STATE_FILE=' "$DAEMON" 2>/dev/null; then
     test_result "STATE_FILE constant present" "pass"
 else
     test_result "STATE_FILE constant present" "fail"
+fi
+
+# Has ensure_btd_input_profile function
+if grep -q 'ensure_btd_input_profile()' "$DAEMON" 2>/dev/null; then
+    test_result "ensure_btd_input_profile() function defined" "pass"
+else
+    test_result "ensure_btd_input_profile() function defined" "fail"
+fi
+
+# Has sleep_resume_loop function
+if grep -q 'sleep_resume_loop()' "$DAEMON" 2>/dev/null; then
+    test_result "sleep_resume_loop() function defined" "pass"
+else
+    test_result "sleep_resume_loop() function defined" "fail"
+fi
+
+# Has rapid_health_check function
+if grep -q 'rapid_health_check()' "$DAEMON" 2>/dev/null; then
+    test_result "rapid_health_check() function defined" "pass"
+else
+    test_result "rapid_health_check() function defined" "fail"
+fi
+
+# Event loop connect handler uses rapid_health_check
+if grep -q 'rapid_health_check' "$DAEMON" 2>/dev/null; then
+    test_result "event_loop references rapid_health_check" "pass"
+else
+    test_result "event_loop references rapid_health_check" "fail"
 fi
 
 # Has signal handling (trap)
@@ -217,8 +251,10 @@ else
 fi
 
 # Check defaults match headset connection state (via daemon state file)
-BTD_SINK="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo"
-BTD_SOURCE="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
+# Dynamic discovery: find BTD-800 sink/source the same way the daemon does
+BTD_USB_ID="usb-1395_Sennheiser_BTD_800_USB-00"
+BTD_SINK=$(pactl list sinks short 2>/dev/null | grep "$BTD_USB_ID" | awk '{print $2}' | head -1)
+BTD_SOURCE=$(pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1)
 SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 STATE_FILE="${XDG_RUNTIME_DIR}/audio-switcher-state"
 
@@ -231,15 +267,15 @@ current_default=$(pactl get-default-sink 2>/dev/null || true)
 current_default_source=$(pactl get-default-source 2>/dev/null || true)
 
 if [[ "$headset_connected" == "true" ]]; then
-    if [[ "$current_default" == "$BTD_SINK" ]]; then
+    if [[ -n "$BTD_SINK" && "$current_default" == "$BTD_SINK" ]]; then
         test_result "default sink is BTD-800 (headset connected)" "pass"
     else
-        test_result "default sink is BTD-800 (headset connected, got: $current_default)" "fail"
+        test_result "default sink is BTD-800 (headset connected, got: $current_default, expected: ${BTD_SINK:-(not found)})" "fail"
     fi
-    if [[ "$current_default_source" == "$BTD_SOURCE" ]]; then
+    if [[ -n "$BTD_SOURCE" && "$current_default_source" == "$BTD_SOURCE" ]]; then
         test_result "default source is BTD-800 mic (headset connected)" "pass"
     else
-        test_result "default source is BTD-800 mic (headset connected, got: $current_default_source)" "fail"
+        test_result "default source is BTD-800 mic (headset connected, got: $current_default_source, expected: ${BTD_SOURCE:-(not found)})" "fail"
     fi
 else
     if [[ "$current_default" == "$SPDIF_SINK" ]]; then

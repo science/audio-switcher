@@ -6,6 +6,8 @@ PipeWire auto-routing and recovery daemon for Linux. Built for the Sennheiser BT
 
 - **Headset detection via HID** — Reads vendor HID reports from the BTD-800 USB dongle to detect headset connect/disconnect. When connected, routes audio to the headset. When disconnected, falls back to S/PDIF speakers.
 - **PipeWire crash recovery** — Monitors journalctl for PipeWire broken-pipe errors. When a threshold is exceeded, restarts PipeWire and re-applies the correct audio defaults based on the current headset state.
+- **Rapid post-connect checks** — After a headset connect event, runs aggressive broken-pipe detection (~10 checks at 3s intervals, threshold=1) to catch streams that break immediately on connection.
+- **Sleep/resume recovery** — Monitors systemd-logind D-Bus signals for system wake events. On resume, re-applies audio defaults and runs rapid health checks (PipeWire streams often break when USB devices lose power during suspend).
 
 ## Why HID?
 
@@ -13,11 +15,13 @@ The BTD-800 dongle handles Bluetooth internally. PipeWire and ALSA always see th
 
 ## Hardware
 
-| Device | PipeWire Name |
+| Device | Identification |
 |--------|---------------|
-| BTD-800 headset output | `alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo` |
-| BTD-800 headset mic | `alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback` |
-| S/PDIF speakers (fallback) | `alsa_output.pci-0000_00_1f.3.iec958-stereo` |
+| BTD-800 headset output | Discovered at runtime by matching `usb-1395_Sennheiser_BTD_800_USB-00` in `pactl list sinks short` |
+| BTD-800 headset mic | Discovered at runtime by matching the same pattern in `pactl list sources short` |
+| S/PDIF speakers (fallback) | `alsa_output.pci-0000_00_1f.3.iec958-stereo` (motherboard, stable) |
+
+BTD-800 sink/source names vary by active card profile (e.g. `analog-stereo` vs `iec958-stereo`). The daemon discovers them dynamically on each connect event.
 
 ## Install
 
@@ -27,7 +31,7 @@ The BTD-800 dongle handles Bluetooth internally. PipeWire and ALSA always see th
 
 This will:
 1. Install a udev rule (`70-btd800.rules`) granting user access to the BTD-800 hidraw device (requires sudo)
-2. Copy `audio-switcher` to `~/.local/bin/`
+2. Symlink `audio-switcher` to `~/.local/bin/` (dev repo changes apply immediately)
 3. Create and enable a systemd user service
 
 ## Uninstall
@@ -54,12 +58,18 @@ journalctl --user-unit audio-switcher -f
 Example output:
 ```
 10:30:15: audio-switcher starting (verbose=false)
+10:30:15:   BTD-800 match:   *usb-1395_Sennheiser_BTD_800_USB-00*
+10:30:15:   BTD-800 sink:    alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo
+10:30:15:   BTD-800 source:  alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback
 10:30:15: Starting HID monitor on /dev/hidraw1...
 10:30:42: EVENT: headset connected
-10:30:42: SWITCH sink → BTD-800 headset
-10:30:42: SWITCH source → BTD-800 mic
+10:30:42: PROFILE: switched to output:analog-stereo+input:mono-fallback (added mic input)
+10:30:42: SWITCH sink → BTD-800 headset (alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo)
+10:30:42: SWITCH source → BTD-800 mic (alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback)
 10:45:01: PW-RECOVERY: 7 broken-pipe errors in last 30s, restarting PipeWire
 10:45:03: PW-RECOVERY: defaults re-applied (state=connected)
+11:20:00: RESUME: system woke from sleep, re-applying defaults
+11:20:02: RESUME: starting rapid health checks
 ```
 
 ## Diagnostics

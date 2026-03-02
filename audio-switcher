@@ -17,8 +17,7 @@
 set -euo pipefail
 
 # --- Constants ---
-BTD_SINK="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.analog-stereo"
-BTD_SOURCE="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
+BTD_USB_ID="usb-1395_Sennheiser_BTD_800_USB-00"    # stable USB vendor/product match pattern
 SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 
 # HID report parsing: vendor report ID 1, byte 19 = connection flag
@@ -75,6 +74,46 @@ find_hidraw() {
     return 1
 }
 
+# --- BTD-800 PipeWire Device Discovery ---
+find_btd_sink() {
+    pactl list sinks short 2>/dev/null | grep "$BTD_USB_ID" | awk '{print $2}' | head -1 || true
+}
+
+find_btd_source() {
+    pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1 || true
+}
+
+# --- BTD-800 Card Profile Management ---
+# Ensure the BTD-800 card profile includes mic input.
+# If active profile is output-only (e.g. "output:analog-stereo"), switch to
+# the variant with input (e.g. "output:analog-stereo+input:mono-fallback").
+ensure_btd_input_profile() {
+    local card="alsa_card.${BTD_USB_ID}"
+    local active_profile
+    active_profile=$(pactl list cards 2>/dev/null \
+        | sed -n "/Name: $card/,/^$/p" \
+        | grep "Active Profile:" | sed 's/.*: //' || true)
+
+    if [[ -z "$active_profile" ]]; then
+        log "WARNING: BTD-800 card not found, cannot set profile"
+        return
+    fi
+
+    # If active profile already has input, nothing to do
+    if [[ "$active_profile" == *"+input:"* ]]; then
+        debug "profile already includes input ($active_profile)"
+        return
+    fi
+
+    # Switch to the same output profile but with mic input
+    local with_input="${active_profile}+input:mono-fallback"
+    if pactl set-card-profile "$card" "$with_input" 2>/dev/null; then
+        log "PROFILE: switched to $with_input (added mic input)"
+    else
+        log "WARNING: failed to set profile $with_input"
+    fi
+}
+
 # --- Core Logic ---
 apply_defaults() {
     local connected="$1"
@@ -84,25 +123,36 @@ apply_defaults() {
     current_source=$(pactl get-default-source 2>/dev/null || true)
 
     if [[ "$connected" == "true" ]]; then
-        # Headset connected → BTD-800
-        if [[ "$current_sink" != "$BTD_SINK" ]]; then
-            if pactl set-default-sink "$BTD_SINK" 2>/dev/null; then
-                log "SWITCH sink → BTD-800 headset"
+        # Ensure card profile includes mic input before discovering devices
+        ensure_btd_input_profile
+
+        # Headset connected → discover BTD-800 sink/source dynamically
+        local btd_sink btd_source
+        btd_sink=$(find_btd_sink)
+        btd_source=$(find_btd_source)
+
+        if [[ -z "$btd_sink" ]]; then
+            log "WARNING: BTD-800 sink not found by PipeWire (device not enumerated yet?)"
+        elif [[ "$current_sink" != "$btd_sink" ]]; then
+            if pactl set-default-sink "$btd_sink" 2>/dev/null; then
+                log "SWITCH sink → BTD-800 headset ($btd_sink)"
             else
-                log "ERROR: failed to set BTD-800 as default sink"
+                log "ERROR: failed to set BTD-800 as default sink ($btd_sink)"
             fi
         else
-            debug "sink already BTD-800, no change"
+            debug "sink already BTD-800 ($btd_sink), no change"
         fi
-        # Set mic
-        if [[ "$current_source" != "$BTD_SOURCE" ]]; then
-            if pactl set-default-source "$BTD_SOURCE" 2>/dev/null; then
-                log "SWITCH source → BTD-800 mic"
+
+        if [[ -z "$btd_source" ]]; then
+            log "WARNING: BTD-800 source not found by PipeWire (device not enumerated yet?)"
+        elif [[ "$current_source" != "$btd_source" ]]; then
+            if pactl set-default-source "$btd_source" 2>/dev/null; then
+                log "SWITCH source → BTD-800 mic ($btd_source)"
             else
-                log "ERROR: failed to set BTD-800 as default source"
+                log "ERROR: failed to set BTD-800 as default source ($btd_source)"
             fi
         else
-            debug "source already BTD-800, no change"
+            debug "source already BTD-800 ($btd_source), no change"
         fi
     else
         # Headset disconnected → S/PDIF fallback
@@ -185,6 +235,55 @@ pipewire_health_loop() {
     done
 }
 
+# --- Rapid Health Check (post-connect) ---
+# Runs ~10 checks at ~3s intervals after a connect event.
+# More aggressive than the background health loop: threshold=1 (any broken pipe triggers restart).
+rapid_health_check() {
+    local since_time="$1"
+    local checks=10
+    local interval=3
+    for ((i=0; i<checks; i++)); do
+        sleep "$interval"
+        local error_count
+        error_count=$(journalctl --user -u pipewire --since "$since_time" --no-pager 2>/dev/null \
+            | grep -c "Broken pipe" || true)
+        if (( error_count > 0 )); then
+            log "RAPID-CHECK: $error_count broken-pipe errors since connect, restarting PipeWire"
+            systemctl --user restart pipewire pipewire-pulse wireplumber
+            date +%s > "$PW_COOLDOWN_FILE"
+            sleep 2
+            local state
+            state=$(read_state)
+            apply_defaults "$([ "$state" = "connected" ] && echo true || echo false)"
+            log "RAPID-CHECK: recovery complete, defaults re-applied"
+            show_status
+            return
+        fi
+    done
+    debug "rapid health checks complete, no issues found"
+}
+
+# --- Sleep/Resume Monitor ---
+# Watches systemd-logind D-Bus signal for resume events.
+# On wake from sleep, re-applies defaults and runs rapid health checks
+# (PipeWire streams often break when USB devices lose power during suspend).
+sleep_resume_loop() {
+    gdbus monitor --system --dest org.freedesktop.login1 \
+        --object-path /org/freedesktop/login1 2>/dev/null \
+    | while IFS= read -r line; do
+        if [[ "$line" == *"PrepareForSleep"*"false"* ]]; then
+            log "RESUME: system woke from sleep, re-applying defaults"
+            sleep 2  # give PipeWire a moment to re-enumerate devices
+            local state
+            state=$(read_state)
+            apply_defaults "$([ "$state" = "connected" ] && echo true || echo false)"
+            show_status
+            log "RESUME: starting rapid health checks"
+            rapid_health_check "$(date '+%Y-%m-%d %H:%M:%S')"
+        fi
+    done
+}
+
 # --- HID Monitor ---
 # Reads BTD-800 hidraw device and calls apply_defaults on connection changes.
 # Uses a small Python helper for binary HID report parsing.
@@ -235,8 +334,15 @@ event_loop() {
                     write_state "connected"
                     apply_defaults true
                     show_status
+                    # Kill any previous rapid-check, start new one
+                    [[ -n "${RAPID_PID:-}" ]] && kill "$RAPID_PID" 2>/dev/null || true
+                    rapid_health_check "$(date '+%Y-%m-%d %H:%M:%S')" &
+                    RAPID_PID=$!
                     ;;
                 disconnected)
+                    # Kill rapid-check if running (no point checking after disconnect)
+                    [[ -n "${RAPID_PID:-}" ]] && kill "$RAPID_PID" 2>/dev/null || true
+                    RAPID_PID=""
                     log "EVENT: headset disconnected"
                     sleep "$SETTLE_DELAY"
                     write_state "disconnected"
@@ -263,9 +369,15 @@ cleanup() {
     trap - SIGTERM SIGINT
     echo ""
     log "Shutting down audio-switcher"
-    # Kill health loop and any other background jobs
+    # Kill health loop, sleep monitor, rapid-check, and any other background jobs
     if [[ -n "${HEALTH_PID:-}" ]]; then
         kill "$HEALTH_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${SLEEP_PID:-}" ]]; then
+        kill "$SLEEP_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${RAPID_PID:-}" ]]; then
+        kill "$RAPID_PID" 2>/dev/null || true
     fi
     jobs -p | xargs -r kill 2>/dev/null || true
     # Clean up runtime files
@@ -277,8 +389,9 @@ trap cleanup SIGTERM SIGINT
 
 # --- Main ---
 log "audio-switcher starting (verbose=$VERBOSE)"
-log "  BTD-800 sink:    $BTD_SINK"
-log "  BTD-800 source:  $BTD_SOURCE"
+log "  BTD-800 match:   *${BTD_USB_ID}*"
+log "  BTD-800 sink:    $(find_btd_sink)"
+log "  BTD-800 source:  $(find_btd_source)"
 log "  S/PDIF fallback: $SPDIF_SINK"
 
 # Find the hidraw device
@@ -303,5 +416,10 @@ echo ""
 pipewire_health_loop &
 HEALTH_PID=$!
 log "  PW health monitor PID: $HEALTH_PID"
+
+# Start sleep/resume monitor in background
+sleep_resume_loop &
+SLEEP_PID=$!
+log "  Sleep/resume monitor PID: $SLEEP_PID"
 
 event_loop "$HIDRAW"

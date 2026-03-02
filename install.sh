@@ -28,11 +28,10 @@ do_install() {
         echo "  udev rule already installed"
     fi
 
-    # Install binary
+    # Install binary (symlink so dev repo changes apply immediately)
     mkdir -p "$(dirname "$INSTALL_BIN")"
-    cp "$SCRIPT_DIR/audio-switcher" "$INSTALL_BIN"
-    chmod 755 "$INSTALL_BIN"
-    echo "  Installed $INSTALL_BIN"
+    ln -sf "$SCRIPT_DIR/audio-switcher" "$INSTALL_BIN"
+    echo "  Installed $INSTALL_BIN → $SCRIPT_DIR/audio-switcher"
 
     # Install systemd user service
     mkdir -p "$SERVICE_DIR"
