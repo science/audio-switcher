@@ -5,6 +5,8 @@ INSTALL_BIN="$HOME/.local/bin/audio-switcher"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/audio-switcher.service"
 UDEV_RULE="/etc/udev/rules.d/70-btd800.rules"
+WP_CONF_DIR="$HOME/.config/wireplumber/main.lua.d"
+WP_CONF_FILE="$WP_CONF_DIR/51-alsa-tuning.lua"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
@@ -27,6 +29,11 @@ do_install() {
     else
         echo "  udev rule already installed"
     fi
+
+    # Install WirePlumber ALSA buffer tuning
+    mkdir -p "$WP_CONF_DIR"
+    cp "$SCRIPT_DIR/51-alsa-tuning.lua" "$WP_CONF_FILE"
+    echo "  Installed $WP_CONF_FILE"
 
     # Install binary (symlink so dev repo changes apply immediately)
     mkdir -p "$(dirname "$INSTALL_BIN")"
@@ -84,6 +91,11 @@ do_uninstall() {
     if [[ -f "$INSTALL_BIN" ]]; then
         rm "$INSTALL_BIN"
         echo "  Removed $INSTALL_BIN"
+    fi
+
+    if [[ -f "$WP_CONF_FILE" ]]; then
+        rm "$WP_CONF_FILE"
+        echo "  Removed $WP_CONF_FILE"
     fi
 
     if [[ -f "$UDEV_RULE" ]]; then

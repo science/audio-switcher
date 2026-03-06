@@ -160,19 +160,70 @@ else
     test_result "sleep_resume_loop() function defined" "fail"
 fi
 
-# Has rapid_health_check function
+# rapid_health_check removed (replaced by hunt mode)
 if grep -q 'rapid_health_check()' "$DAEMON" 2>/dev/null; then
-    test_result "rapid_health_check() function defined" "pass"
+    test_result "rapid_health_check() removed (replaced by hunt mode)" "fail"
 else
-    test_result "rapid_health_check() function defined" "fail"
+    test_result "rapid_health_check() removed (replaced by hunt mode)" "pass"
 fi
 
-# Event loop connect handler uses rapid_health_check
-if grep -q 'rapid_health_check' "$DAEMON" 2>/dev/null; then
-    test_result "event_loop references rapid_health_check" "pass"
+# Has notify_user function
+if grep -q 'notify_user()' "$DAEMON" 2>/dev/null; then
+    test_result "notify_user() function defined" "pass"
 else
-    test_result "event_loop references rapid_health_check" "fail"
+    test_result "notify_user() function defined" "fail"
 fi
+
+# Has notify_pw_restart function for PipeWire restart notifications
+if grep -q 'notify_pw_restart()' "$DAEMON" 2>/dev/null; then
+    test_result "notify_pw_restart() function defined" "pass"
+else
+    test_result "notify_pw_restart() function defined" "fail"
+fi
+
+# PW restart notification has cooldown guard (PW_NOTIFY_COOLDOWN_SECONDS)
+if grep -q 'PW_NOTIFY_COOLDOWN_SECONDS=' "$DAEMON" 2>/dev/null; then
+    test_result "PW_NOTIFY_COOLDOWN_SECONDS constant present" "pass"
+else
+    test_result "PW_NOTIFY_COOLDOWN_SECONDS constant present" "fail"
+fi
+
+# PW restart notification cooldown file
+if grep -q 'PW_NOTIFY_COOLDOWN_FILE=' "$DAEMON" 2>/dev/null; then
+    test_result "PW_NOTIFY_COOLDOWN_FILE constant present" "pass"
+else
+    test_result "PW_NOTIFY_COOLDOWN_FILE constant present" "fail"
+fi
+
+# notify_pw_restart is called after PipeWire restart in check_pipewire_health
+if sed -n '/^check_pipewire_health()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'notify_pw_restart'; then
+    test_result "notify_pw_restart called after PipeWire restart" "pass"
+else
+    test_result "notify_pw_restart called after PipeWire restart" "fail"
+fi
+
+# cleanup removes the notification cooldown file
+if grep 'rm -f' "$DAEMON" 2>/dev/null | grep -q 'PW_NOTIFY_COOLDOWN_FILE'; then
+    test_result "cleanup removes PW_NOTIFY_COOLDOWN_FILE" "pass"
+else
+    test_result "cleanup removes PW_NOTIFY_COOLDOWN_FILE" "fail"
+fi
+
+# Has fix subcommand
+if grep -q 'fix)' "$DAEMON" 2>/dev/null; then
+    test_result "fix subcommand handled in argument parsing" "pass"
+else
+    test_result "fix subcommand handled in argument parsing" "fail"
+fi
+
+# Hunt mode constants
+for const in PW_HUNT_DURATION PW_HUNT_INTERVAL; do
+    if grep -q "${const}=" "$DAEMON" 2>/dev/null; then
+        test_result "${const} constant present" "pass"
+    else
+        test_result "${const} constant present" "fail"
+    fi
+done
 
 # Has signal handling (trap)
 if grep -q 'trap' "$DAEMON" 2>/dev/null; then

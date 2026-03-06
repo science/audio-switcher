@@ -5,9 +5,9 @@ PipeWire auto-routing and recovery daemon for Linux. Built for the Sennheiser BT
 ## What It Does
 
 - **Headset detection via HID** — Reads vendor HID reports from the BTD-800 USB dongle to detect headset connect/disconnect. When connected, routes audio to the headset. When disconnected, falls back to S/PDIF speakers.
-- **PipeWire crash recovery** — Monitors journalctl for PipeWire broken-pipe errors. When a threshold is exceeded, restarts PipeWire and re-applies the correct audio defaults based on the current headset state.
-- **Rapid post-connect checks** — After a headset connect event, runs aggressive broken-pipe detection (~10 checks at 3s intervals, threshold=1) to catch streams that break immediately on connection.
-- **Sleep/resume recovery** — Monitors systemd-logind D-Bus signals for system wake events. On resume, re-applies audio defaults and runs rapid health checks (PipeWire streams often break when USB devices lose power during suspend).
+- **PipeWire crash recovery** — Monitors journalctl for PipeWire broken-pipe errors. When a threshold is exceeded, restarts PipeWire and re-applies the correct audio defaults based on the current headset state. Enters "hunt mode" after connect and resume events for aggressive monitoring.
+- **Desktop notifications** — Sends a persistent (critical) desktop notification when PipeWire is restarted, warning that apps like Slack may need restarting. Cooldown-guarded to max one notification per 5 minutes.
+- **Sleep/resume recovery** — Monitors systemd-logind D-Bus signals for system wake events. On resume, re-applies audio defaults and enters hunt mode (PipeWire streams often break when USB devices lose power during suspend).
 
 ## Why HID?
 
@@ -69,7 +69,7 @@ Example output:
 10:45:01: PW-RECOVERY: 7 broken-pipe errors in last 30s, restarting PipeWire
 10:45:03: PW-RECOVERY: defaults re-applied (state=connected)
 11:20:00: RESUME: system woke from sleep, re-applying defaults
-11:20:02: RESUME: starting rapid health checks
+11:20:02: RESUME: entering hunt mode for post-resume monitoring
 ```
 
 ## Diagnostics

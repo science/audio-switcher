@@ -28,7 +28,11 @@ BTD_HID_CONNECT_BYTE=19  # 0-indexed within full report (including report ID byt
 PW_ERROR_THRESHOLD=5         # broken-pipe errors in check window to trigger restart
 PW_CHECK_WINDOW="30s"        # how far back to look in the journal
 PW_COOLDOWN_SECONDS=300      # minimum seconds between restarts (5 minutes)
+PW_HUNT_DURATION=300         # hunt mode duration (5 minutes)
+PW_HUNT_INTERVAL=10          # hunt mode check interval (seconds)
 PW_COOLDOWN_FILE="${XDG_RUNTIME_DIR}/audio-switcher-pw-cooldown"
+PW_NOTIFY_COOLDOWN_SECONDS=300  # max one restart notification per 5 minutes
+PW_NOTIFY_COOLDOWN_FILE="${XDG_RUNTIME_DIR}/audio-switcher-notify-cooldown"
 
 # State file: IPC between HID event loop and health check loop
 # (background subshells can't share variables — state file is simplest IPC)
@@ -38,9 +42,15 @@ STATE_FILE="${XDG_RUNTIME_DIR}/audio-switcher-state"
 SETTLE_DELAY=0.3
 
 VERBOSE=false
-if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
-    VERBOSE=true
-fi
+ACTION="daemon"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose) VERBOSE=true; shift ;;
+        fix) ACTION="fix"; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
 
 # --- Logging ---
 log() {
@@ -51,6 +61,33 @@ debug() {
     if [[ "$VERBOSE" == true ]]; then
         echo "$(date '+%H:%M:%S'): [debug] $*"
     fi
+}
+
+# --- Desktop Notifications ---
+notify_user() {
+    local urgency="$1" title="$2" body="$3"
+    notify-send -u "$urgency" -a "audio-switcher" "$title" "$body" 2>/dev/null || true
+}
+
+# --- PipeWire Restart Notification (cooldown-guarded) ---
+notify_pw_restart() {
+    local reason="$1"
+    local now
+    now=$(date +%s)
+
+    if [[ -f "$PW_NOTIFY_COOLDOWN_FILE" ]]; then
+        local last_notify
+        last_notify=$(cat "$PW_NOTIFY_COOLDOWN_FILE")
+        if (( now - last_notify < PW_NOTIFY_COOLDOWN_SECONDS )); then
+            debug "suppressing restart notification (cooldown active)"
+            return 0
+        fi
+    fi
+
+    echo "$now" > "$PW_NOTIFY_COOLDOWN_FILE"
+    notify_user critical "PipeWire Restarted" \
+        "$reason\nApps like Slack may need to be restarted to restore audio."
+    log "NOTIFY: PipeWire restart notification sent"
 }
 
 # --- Find BTD-800 hidraw device ---
@@ -190,29 +227,44 @@ read_state() {
     fi
 }
 
+# --- Hunt Mode State ---
+# Cooldown file format: "<timestamp> <mode>" where mode is "hunt" or "normal"
+read_cooldown_state() {
+    LAST_RESTART=0
+    CURRENT_MODE="normal"
+    if [[ -f "$PW_COOLDOWN_FILE" ]]; then
+        read -r LAST_RESTART CURRENT_MODE < "$PW_COOLDOWN_FILE" || true
+        CURRENT_MODE="${CURRENT_MODE:-normal}"
+    fi
+}
+
 # --- PipeWire Health Monitor ---
 check_pipewire_health() {
-    # Check cooldown — don't restart too frequently
-    if [[ -f "$PW_COOLDOWN_FILE" ]]; then
-        local last_restart now
-        last_restart=$(cat "$PW_COOLDOWN_FILE")
+    local threshold="${1:-$PW_ERROR_THRESHOLD}"
+
+    read_cooldown_state
+
+    # In normal mode, check cooldown — don't restart too frequently
+    if [[ "$CURRENT_MODE" == "normal" && "$LAST_RESTART" -gt 0 ]]; then
+        local now
         now=$(date +%s)
-        if (( now - last_restart < PW_COOLDOWN_SECONDS )); then
+        if (( now - LAST_RESTART < PW_COOLDOWN_SECONDS )); then
             return 0
         fi
     fi
+    # In hunt mode, no cooldown — always check
 
     # Count broken-pipe errors in the check window
     local error_count
     error_count=$(journalctl --user -u pipewire --since "-${PW_CHECK_WINDOW}" --no-pager 2>/dev/null \
         | grep -c "Broken pipe" || true)
 
-    if (( error_count >= PW_ERROR_THRESHOLD )); then
-        log "PW-RECOVERY: $error_count broken-pipe errors in last ${PW_CHECK_WINDOW}, restarting PipeWire"
+    if (( error_count >= threshold )); then
+        log "PW-RECOVERY: $error_count broken-pipe errors in last ${PW_CHECK_WINDOW} (mode=$CURRENT_MODE, threshold=$threshold), restarting PipeWire"
         systemctl --user restart pipewire pipewire-pulse wireplumber
 
-        # Record restart time for cooldown
-        date +%s > "$PW_COOLDOWN_FILE"
+        # Enter/stay in hunt mode
+        echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
 
         # Give PipeWire time to enumerate devices, then re-apply correct defaults
         sleep 2
@@ -225,42 +277,33 @@ check_pipewire_health() {
         fi
         log "PW-RECOVERY: defaults re-applied (state=$state)"
         show_status
+        notify_pw_restart "PipeWire restarted ($error_count broken pipe errors)"
     fi
 }
 
 pipewire_health_loop() {
     while true; do
-        sleep 30
-        check_pipewire_health || true
-    done
-}
+        read_cooldown_state
 
-# --- Rapid Health Check (post-connect) ---
-# Runs ~10 checks at ~3s intervals after a connect event.
-# More aggressive than the background health loop: threshold=1 (any broken pipe triggers restart).
-rapid_health_check() {
-    local since_time="$1"
-    local checks=10
-    local interval=3
-    for ((i=0; i<checks; i++)); do
-        sleep "$interval"
-        local error_count
-        error_count=$(journalctl --user -u pipewire --since "$since_time" --no-pager 2>/dev/null \
-            | grep -c "Broken pipe" || true)
-        if (( error_count > 0 )); then
-            log "RAPID-CHECK: $error_count broken-pipe errors since connect, restarting PipeWire"
-            systemctl --user restart pipewire pipewire-pulse wireplumber
-            date +%s > "$PW_COOLDOWN_FILE"
-            sleep 2
-            local state
-            state=$(read_state)
-            apply_defaults "$([ "$state" = "connected" ] && echo true || echo false)"
-            log "RAPID-CHECK: recovery complete, defaults re-applied"
-            show_status
-            return
+        local interval=30
+        local threshold=$PW_ERROR_THRESHOLD
+
+        if [[ "$CURRENT_MODE" == "hunt" ]]; then
+            local now
+            now=$(date +%s)
+            if (( now - LAST_RESTART >= PW_HUNT_DURATION )); then
+                # Hunt expired — back to normal with cooldown
+                log "HUNT: ${PW_HUNT_DURATION}s clean, returning to normal mode"
+                echo "$(date +%s) normal" > "$PW_COOLDOWN_FILE"
+            else
+                interval=$PW_HUNT_INTERVAL
+                threshold=1
+            fi
         fi
+
+        sleep "$interval"
+        check_pipewire_health "$threshold" || true
     done
-    debug "rapid health checks complete, no issues found"
 }
 
 # --- Sleep/Resume Monitor ---
@@ -278,8 +321,9 @@ sleep_resume_loop() {
             state=$(read_state)
             apply_defaults "$([ "$state" = "connected" ] && echo true || echo false)"
             show_status
-            log "RESUME: starting rapid health checks"
-            rapid_health_check "$(date '+%Y-%m-%d %H:%M:%S')"
+            # Enter hunt mode — USB devices often break after resume
+            log "RESUME: entering hunt mode for post-resume monitoring"
+            echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
         fi
     done
 }
@@ -334,15 +378,11 @@ event_loop() {
                     write_state "connected"
                     apply_defaults true
                     show_status
-                    # Kill any previous rapid-check, start new one
-                    [[ -n "${RAPID_PID:-}" ]] && kill "$RAPID_PID" 2>/dev/null || true
-                    rapid_health_check "$(date '+%Y-%m-%d %H:%M:%S')" &
-                    RAPID_PID=$!
+                    # Enter hunt mode — newly connected devices are prone to broken pipes
+                    log "HUNT: entering hunt mode after headset connect"
+                    echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
                     ;;
                 disconnected)
-                    # Kill rapid-check if running (no point checking after disconnect)
-                    [[ -n "${RAPID_PID:-}" ]] && kill "$RAPID_PID" 2>/dev/null || true
-                    RAPID_PID=""
                     log "EVENT: headset disconnected"
                     sleep "$SETTLE_DELAY"
                     write_state "disconnected"
@@ -369,25 +409,50 @@ cleanup() {
     trap - SIGTERM SIGINT
     echo ""
     log "Shutting down audio-switcher"
-    # Kill health loop, sleep monitor, rapid-check, and any other background jobs
+    # Kill health loop, sleep monitor, and any other background jobs
     if [[ -n "${HEALTH_PID:-}" ]]; then
         kill "$HEALTH_PID" 2>/dev/null || true
     fi
     if [[ -n "${SLEEP_PID:-}" ]]; then
         kill "$SLEEP_PID" 2>/dev/null || true
     fi
-    if [[ -n "${RAPID_PID:-}" ]]; then
-        kill "$RAPID_PID" 2>/dev/null || true
-    fi
     jobs -p | xargs -r kill 2>/dev/null || true
     # Clean up runtime files
-    rm -f "$STATE_FILE" "$PW_COOLDOWN_FILE"
+    rm -f "$STATE_FILE" "$PW_COOLDOWN_FILE" "$PW_NOTIFY_COOLDOWN_FILE"
     exit 0
 }
 
 trap cleanup SIGTERM SIGINT
 
+# --- Fix Subcommand ---
+do_fix() {
+    local error_count
+    error_count=$(journalctl --user -u pipewire --since "-120s" --no-pager 2>/dev/null \
+        | grep -c "Broken pipe" || true)
+
+    if (( error_count > 0 )); then
+        log "FIX: $error_count broken-pipe errors in last 120s, restarting PipeWire"
+        systemctl --user restart pipewire pipewire-pulse wireplumber
+        sleep 2
+        local state
+        state=$(read_state)
+        apply_defaults "$([ "$state" = "connected" ] && echo true || echo false)"
+        log "FIX: recovery complete"
+        show_status
+        notify_pw_restart "Manual fix: PipeWire restarted ($error_count broken pipe errors)"
+    else
+        log "FIX: no broken-pipe errors in last 120s — audio appears healthy"
+        show_status
+        notify_user normal "Audio Healthy" "No broken pipe errors detected"
+    fi
+}
+
 # --- Main ---
+if [[ "$ACTION" == "fix" ]]; then
+    do_fix
+    exit 0
+fi
+
 log "audio-switcher starting (verbose=$VERBOSE)"
 log "  BTD-800 match:   *${BTD_USB_ID}*"
 log "  BTD-800 sink:    $(find_btd_sink)"
