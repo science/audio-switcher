@@ -225,6 +225,13 @@ for const in PW_HUNT_DURATION PW_HUNT_INTERVAL; do
     fi
 done
 
+# apply_defaults disconnect path retries SPDIF sink on failure
+if sed -n '/apply_defaults()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'max_attempts'; then
+    test_result "apply_defaults retries S/PDIF sink on disconnect failure" "pass"
+else
+    test_result "apply_defaults retries S/PDIF sink on disconnect failure" "fail"
+fi
+
 # Has signal handling (trap)
 if grep -q 'trap' "$DAEMON" 2>/dev/null; then
     test_result "signal handling (trap) present" "pass"

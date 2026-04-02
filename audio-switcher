@@ -192,12 +192,22 @@ apply_defaults() {
             debug "source already BTD-800 ($btd_source), no change"
         fi
     else
-        # Headset disconnected → S/PDIF fallback
+        # Headset disconnected → S/PDIF fallback (with retry for PipeWire re-enumeration)
         if [[ "$current_sink" != "$SPDIF_SINK" ]]; then
-            if pactl set-default-sink "$SPDIF_SINK" 2>/dev/null; then
-                log "SWITCH sink → S/PDIF speakers"
-            else
-                log "ERROR: failed to set S/PDIF as default sink"
+            local attempts=0 max_attempts=5
+            while (( attempts < max_attempts )); do
+                if pactl set-default-sink "$SPDIF_SINK" 2>/dev/null; then
+                    log "SWITCH sink → S/PDIF speakers"
+                    break
+                fi
+                (( attempts++ ))
+                if (( attempts < max_attempts )); then
+                    debug "S/PDIF sink not available, retrying ($attempts/$max_attempts)..."
+                    sleep 1
+                fi
+            done
+            if (( attempts == max_attempts )); then
+                log "ERROR: failed to set S/PDIF as default sink after $max_attempts attempts"
             fi
         else
             debug "sink already S/PDIF, no change"
