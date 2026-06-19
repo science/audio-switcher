@@ -23,6 +23,16 @@ test_result() {
     fi
 }
 
+# Assert helper: pass if "$1" == "$2", else fail with detail
+assert_eq() {
+    local name="$1" got="$2" want="$3"
+    if [[ "$got" == "$want" ]]; then
+        test_result "$name" "pass"
+    else
+        test_result "$name (got: '$got', want: '$want')" "fail"
+    fi
+}
+
 echo "=== Audio Switcher Tests ==="
 echo ""
 
@@ -64,18 +74,14 @@ else
     test_result "BTD_USB_ID pattern constant present" "fail"
 fi
 
-# Dynamic discovery functions
-if grep -q 'find_btd_sink()' "$DAEMON" 2>/dev/null; then
-    test_result "find_btd_sink() function defined" "pass"
-else
-    test_result "find_btd_sink() function defined" "fail"
-fi
-
-if grep -q 'find_btd_source()' "$DAEMON" 2>/dev/null; then
-    test_result "find_btd_source() function defined" "pass"
-else
-    test_result "find_btd_source() function defined" "fail"
-fi
+# Dynamic discovery functions (BTD)
+for func in find_btd_sink find_btd_source; do
+    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
+        test_result "${func}() function defined" "pass"
+    else
+        test_result "${func}() function defined" "fail"
+    fi
+done
 
 # S/PDIF fallback sink constant
 if grep -q 'alsa_output.pci-0000_00_1f.3.iec958-stereo' "$DAEMON" 2>/dev/null; then
@@ -84,14 +90,54 @@ else
     test_result "S/PDIF fallback sink constant present" "fail"
 fi
 
-# Has apply_defaults function
-if grep -q 'apply_defaults()' "$DAEMON" 2>/dev/null; then
-    test_result "apply_defaults() function defined" "pass"
+# --- Jabra static checks ---
+# Jabra sink/source match pattern
+if grep -q 'JABRA_SINK_MATCH=.*Jabra_Link_390' "$DAEMON" 2>/dev/null; then
+    test_result "JABRA_SINK_MATCH pattern constant present" "pass"
 else
-    test_result "apply_defaults() function defined" "fail"
+    test_result "JABRA_SINK_MATCH pattern constant present" "fail"
 fi
 
-# Has HID detection functions
+# Jabra USB vendor id for hidraw discovery
+if grep -q 'JABRA_VID=.*0b0e' "$DAEMON" 2>/dev/null; then
+    test_result "JABRA_VID constant present" "pass"
+else
+    test_result "JABRA_VID constant present" "fail"
+fi
+
+# Jabra HID report id constant
+if grep -q 'JABRA_HID_REPORT_ID=' "$DAEMON" 2>/dev/null; then
+    test_result "JABRA_HID_REPORT_ID constant present" "pass"
+else
+    test_result "JABRA_HID_REPORT_ID constant present" "fail"
+fi
+
+# Jabra discovery + monitor + profile functions
+for func in find_jabra_hidraw find_jabra_sink find_jabra_source monitor_jabra_hidraw ensure_jabra_input_profile; do
+    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
+        test_result "${func}() function defined" "pass"
+    else
+        test_result "${func}() function defined" "fail"
+    fi
+done
+
+# --- Priority routing functions ---
+for func in resolve_active_device apply_priority apply_spdif_sink set_device_state get_device_state; do
+    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
+        test_result "${func}() function defined" "pass"
+    else
+        test_result "${func}() function defined" "fail"
+    fi
+done
+
+# apply_spdif_sink retries on failure (PipeWire re-enumeration)
+if sed -n '/apply_spdif_sink()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'max_attempts'; then
+    test_result "apply_spdif_sink retries S/PDIF sink on failure" "pass"
+else
+    test_result "apply_spdif_sink retries S/PDIF sink on failure" "fail"
+fi
+
+# Has BTD HID detection functions
 for func in event_loop monitor_hidraw find_hidraw; do
     if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
         test_result "${func}() function defined" "pass"
@@ -100,18 +146,14 @@ for func in event_loop monitor_hidraw find_hidraw; do
     fi
 done
 
-# Has HID report constants
-if grep -q 'BTD_HID_REPORT_ID=' "$DAEMON" 2>/dev/null; then
-    test_result "BTD_HID_REPORT_ID constant present" "pass"
-else
-    test_result "BTD_HID_REPORT_ID constant present" "fail"
-fi
-
-if grep -q 'BTD_HID_CONNECT_BYTE=' "$DAEMON" 2>/dev/null; then
-    test_result "BTD_HID_CONNECT_BYTE constant present" "pass"
-else
-    test_result "BTD_HID_CONNECT_BYTE constant present" "fail"
-fi
+# Has BTD HID report constants
+for const in BTD_HID_REPORT_ID BTD_HID_CONNECT_BYTE; do
+    if grep -q "${const}=" "$DAEMON" 2>/dev/null; then
+        test_result "${const} constant present" "pass"
+    else
+        test_result "${const} constant present" "fail"
+    fi
+done
 
 # Has PipeWire recovery functions
 for func in check_pipewire_health pipewire_health_loop; do
@@ -131,15 +173,7 @@ for const in PW_ERROR_THRESHOLD PW_COOLDOWN_SECONDS; do
     fi
 done
 
-# Has state file IPC
-for func in write_state read_state; do
-    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
-        test_result "${func}() function defined" "pass"
-    else
-        test_result "${func}() function defined" "fail"
-    fi
-done
-
+# State file IPC
 if grep -q 'STATE_FILE=' "$DAEMON" 2>/dev/null; then
     test_result "STATE_FILE constant present" "pass"
 else
@@ -160,11 +194,11 @@ else
     test_result "sleep_resume_loop() function defined" "fail"
 fi
 
-# rapid_health_check removed (replaced by hunt mode)
-if grep -q 'rapid_health_check()' "$DAEMON" 2>/dev/null; then
-    test_result "rapid_health_check() removed (replaced by hunt mode)" "fail"
+# Daemon is sourceable (main guarded so tests can source it)
+if grep -qE 'BASH_SOURCE\[0\].*==.*\$\{?0' "$DAEMON" 2>/dev/null; then
+    test_result "daemon guards main() for sourceability" "pass"
 else
-    test_result "rapid_health_check() removed (replaced by hunt mode)" "pass"
+    test_result "daemon guards main() for sourceability" "fail"
 fi
 
 # Has notify_user function
@@ -225,13 +259,6 @@ for const in PW_HUNT_DURATION PW_HUNT_INTERVAL; do
     fi
 done
 
-# apply_defaults disconnect path retries SPDIF sink on failure
-if sed -n '/apply_defaults()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'max_attempts'; then
-    test_result "apply_defaults retries S/PDIF sink on disconnect failure" "pass"
-else
-    test_result "apply_defaults retries S/PDIF sink on disconnect failure" "fail"
-fi
-
 # Has signal handling (trap)
 if grep -q 'trap' "$DAEMON" 2>/dev/null; then
     test_result "signal handling (trap) present" "pass"
@@ -253,12 +280,65 @@ else
     test_result "install.sh supports --uninstall" "fail"
 fi
 
+# install.sh installs the Jabra udev rule
+if grep -q '70-jabra.rules' "$INSTALL_SCRIPT" 2>/dev/null; then
+    test_result "install.sh references 70-jabra.rules" "pass"
+else
+    test_result "install.sh references 70-jabra.rules" "fail"
+fi
+
+# Jabra udev rule file exists and grants hidraw access for vid 0b0e
+if [[ -f "$PROJECT_DIR/70-jabra.rules" ]] && grep -q '0b0e' "$PROJECT_DIR/70-jabra.rules" 2>/dev/null; then
+    test_result "70-jabra.rules exists and matches vid 0b0e" "pass"
+else
+    test_result "70-jabra.rules exists and matches vid 0b0e" "fail"
+fi
+
 # uninstall.sh exists and is executable
 if [[ -f "$UNINSTALL_SCRIPT" && -x "$UNINSTALL_SCRIPT" ]]; then
     test_result "uninstall.sh exists and is executable" "pass"
 else
     test_result "uninstall.sh exists and is executable" "fail"
 fi
+
+echo ""
+
+# --- Unit: priority resolver truth table ---
+echo "--- Unit: resolve_active_device ---"
+
+# resolve_for <jabra-state> <btd-state> -> echoes resolved device
+resolve_for() {
+    local tmp
+    tmp=$(mktemp)
+    printf 'jabra=%s\nbtd=%s\n' "$1" "$2" > "$tmp"
+    STATE_FILE="$tmp" bash -c "source '$DAEMON'; resolve_active_device" 2>/dev/null
+    rm -f "$tmp"
+}
+
+assert_eq "Jabra wins when both connected"          "$(resolve_for connected connected)"       "jabra"
+assert_eq "Jabra wins when only Jabra connected"    "$(resolve_for connected disconnected)"    "jabra"
+assert_eq "BTD wins when only BTD connected"        "$(resolve_for disconnected connected)"    "btd"
+assert_eq "none when neither connected"             "$(resolve_for disconnected disconnected)" "none"
+
+echo ""
+
+# --- Unit: Jabra HID parser ---
+echo "--- Unit: monitor_jabra_hidraw parser ---"
+
+# jabra_parse <hex> -> runs the parser against a one-report binary file
+jabra_parse() {
+    local tmp
+    tmp=$(mktemp)
+    python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex('$1'))" > "$tmp"
+    STATE_FILE=/dev/null bash -c "source '$DAEMON'; monitor_jabra_hidraw '$tmp'" 2>/dev/null
+    rm -f "$tmp"
+}
+
+# Confirmed signatures: header 05 00 01 00 08 0d, byte[6] 01=connect / 02=disconnect
+assert_eq "parser: 08 0d 01 -> connected"      "$(jabra_parse 05000100080d01010402)" "connected"
+assert_eq "parser: 08 0d 02 -> disconnected"   "$(jabra_parse 05000100080d02010402)" "disconnected"
+# Lookalike report (byte2=04, '05 00 04 ..') must NOT match
+assert_eq "parser: 05 00 04 lookalike ignored" "$(jabra_parse 05000451080d010a0900)" ""
 
 echo ""
 
@@ -298,7 +378,7 @@ fi
 
 echo ""
 
-# --- Runtime Checks ---
+# --- Runtime Checks (priority model) ---
 echo "--- Runtime Checks ---"
 
 # pactl is available
@@ -308,42 +388,66 @@ else
     test_result "pactl is available" "fail"
 fi
 
-# Check defaults match headset connection state (via daemon state file)
-# Dynamic discovery: find BTD-800 sink/source the same way the daemon does
 BTD_USB_ID="usb-1395_Sennheiser_BTD_800_USB-00"
-BTD_SINK=$(pactl list sinks short 2>/dev/null | grep "$BTD_USB_ID" | awk '{print $2}' | head -1)
-BTD_SOURCE=$(pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1)
+JABRA_MATCH="Jabra_Link_390"
 SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 STATE_FILE="${XDG_RUNTIME_DIR}/audio-switcher-state"
 
-headset_connected=false
-if [[ -f "$STATE_FILE" ]] && [[ "$(cat "$STATE_FILE")" == "connected" ]]; then
-    headset_connected=true
+# Read a device's state from the daemon state file (default disconnected)
+rt_get_state() {
+    local d="$1" line=""
+    [[ -f "$STATE_FILE" ]] && line=$(grep "^${d}=" "$STATE_FILE" 2>/dev/null | tail -1)
+    if [[ -n "$line" ]]; then echo "${line#*=}"; else echo "disconnected"; fi
+}
+
+active="none"
+if [[ "$(rt_get_state jabra)" == "connected" ]]; then
+    active="jabra"
+elif [[ "$(rt_get_state btd)" == "connected" ]]; then
+    active="btd"
 fi
 
-current_default=$(pactl get-default-sink 2>/dev/null || true)
-current_default_source=$(pactl get-default-source 2>/dev/null || true)
+current_sink=$(pactl get-default-sink 2>/dev/null || true)
+current_source=$(pactl get-default-source 2>/dev/null || true)
 
-if [[ "$headset_connected" == "true" ]]; then
-    if [[ -n "$BTD_SINK" && "$current_default" == "$BTD_SINK" ]]; then
-        test_result "default sink is BTD-800 (headset connected)" "pass"
-    else
-        test_result "default sink is BTD-800 (headset connected, got: $current_default, expected: ${BTD_SINK:-(not found)})" "fail"
-    fi
-    if [[ -n "$BTD_SOURCE" && "$current_default_source" == "$BTD_SOURCE" ]]; then
-        test_result "default source is BTD-800 mic (headset connected)" "pass"
-    else
-        test_result "default source is BTD-800 mic (headset connected, got: $current_default_source, expected: ${BTD_SOURCE:-(not found)})" "fail"
-    fi
-else
-    if [[ "$current_default" == "$SPDIF_SINK" ]]; then
-        test_result "default sink is S/PDIF (headset disconnected)" "pass"
-    else
-        test_result "default sink is S/PDIF (headset disconnected, got: $current_default)" "fail"
-    fi
-    # No expected source when headset disconnected — PipeWire chooses
-    test_result "headset disconnected — source check skipped (PipeWire chooses)" "pass"
-fi
+case "$active" in
+    jabra)
+        J_SINK=$(pactl list sinks short 2>/dev/null | grep "$JABRA_MATCH" | awk '{print $2}' | head -1)
+        J_SRC=$(pactl list sources short 2>/dev/null | grep "$JABRA_MATCH" | grep -v '\.monitor' | awk '{print $2}' | head -1)
+        if [[ -n "$J_SINK" && "$current_sink" == "$J_SINK" ]]; then
+            test_result "default sink is Jabra (buds connected)" "pass"
+        else
+            test_result "default sink is Jabra (buds connected, got: $current_sink, expected: ${J_SINK:-(not found)})" "fail"
+        fi
+        if [[ -n "$J_SRC" && "$current_source" == "$J_SRC" ]]; then
+            test_result "default source is Jabra mic (buds connected)" "pass"
+        else
+            test_result "default source is Jabra mic (buds connected, got: $current_source, expected: ${J_SRC:-(not found)})" "fail"
+        fi
+        ;;
+    btd)
+        BTD_SINK=$(pactl list sinks short 2>/dev/null | grep "$BTD_USB_ID" | awk '{print $2}' | head -1)
+        BTD_SOURCE=$(pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1)
+        if [[ -n "$BTD_SINK" && "$current_sink" == "$BTD_SINK" ]]; then
+            test_result "default sink is BTD-800 (headset connected)" "pass"
+        else
+            test_result "default sink is BTD-800 (headset connected, got: $current_sink, expected: ${BTD_SINK:-(not found)})" "fail"
+        fi
+        if [[ -n "$BTD_SOURCE" && "$current_source" == "$BTD_SOURCE" ]]; then
+            test_result "default source is BTD-800 mic (headset connected)" "pass"
+        else
+            test_result "default source is BTD-800 mic (headset connected, got: $current_source, expected: ${BTD_SOURCE:-(not found)})" "fail"
+        fi
+        ;;
+    none)
+        if [[ "$current_sink" == "$SPDIF_SINK" ]]; then
+            test_result "default sink is S/PDIF (no headset active)" "pass"
+        else
+            test_result "default sink is S/PDIF (no headset active, got: $current_sink)" "fail"
+        fi
+        test_result "no headset active — source check skipped (PipeWire chooses)" "pass"
+        ;;
+esac
 
 echo ""
 

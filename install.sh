@@ -5,6 +5,7 @@ INSTALL_BIN="$HOME/.local/bin/audio-switcher"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/audio-switcher.service"
 UDEV_RULE="/etc/udev/rules.d/70-btd800.rules"
+JABRA_UDEV_RULE="/etc/udev/rules.d/70-jabra.rules"
 WP_CONF_DIR="$HOME/.config/wireplumber/main.lua.d"
 WP_CONF_FILE="$WP_CONF_DIR/51-alsa-tuning.lua"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,15 +20,27 @@ usage() {
 do_install() {
     echo "Installing audio-switcher..."
 
-    # Install udev rule for hidraw access (needs sudo)
+    # Install udev rules for hidraw access (needs sudo)
+    local reload_udev=false
     if [[ ! -f "$UDEV_RULE" ]]; then
         echo "  Installing udev rule for BTD-800 hidraw access (requires sudo)..."
         sudo cp "$SCRIPT_DIR/70-btd800.rules" "$UDEV_RULE"
+        echo "  Installed $UDEV_RULE"
+        reload_udev=true
+    else
+        echo "  BTD-800 udev rule already installed"
+    fi
+    if [[ ! -f "$JABRA_UDEV_RULE" ]]; then
+        echo "  Installing udev rule for Jabra Link 390 hidraw access (requires sudo)..."
+        sudo cp "$SCRIPT_DIR/70-jabra.rules" "$JABRA_UDEV_RULE"
+        echo "  Installed $JABRA_UDEV_RULE"
+        reload_udev=true
+    else
+        echo "  Jabra udev rule already installed"
+    fi
+    if [[ "$reload_udev" == true ]]; then
         sudo udevadm control --reload-rules
         sudo udevadm trigger
-        echo "  Installed $UDEV_RULE"
-    else
-        echo "  udev rule already installed"
     fi
 
     # Install WirePlumber ALSA buffer tuning
@@ -98,11 +111,21 @@ do_uninstall() {
         echo "  Removed $WP_CONF_FILE"
     fi
 
+    local removed_udev=false
     if [[ -f "$UDEV_RULE" ]]; then
-        echo "  Removing udev rule (requires sudo)..."
+        echo "  Removing BTD-800 udev rule (requires sudo)..."
         sudo rm "$UDEV_RULE"
-        sudo udevadm control --reload-rules
         echo "  Removed $UDEV_RULE"
+        removed_udev=true
+    fi
+    if [[ -f "$JABRA_UDEV_RULE" ]]; then
+        echo "  Removing Jabra udev rule (requires sudo)..."
+        sudo rm "$JABRA_UDEV_RULE"
+        echo "  Removed $JABRA_UDEV_RULE"
+        removed_udev=true
+    fi
+    if [[ "$removed_udev" == true ]]; then
+        sudo udevadm control --reload-rules
     fi
 
     echo ""

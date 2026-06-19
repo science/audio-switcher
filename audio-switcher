@@ -1,28 +1,41 @@
 #!/bin/bash
 # audio-switcher — PipeWire auto-routing daemon
 #
-# Detects Sennheiser BTD-800 headset connection via HID reports from
-# the USB dongle's hidraw device, then sets PipeWire audio defaults:
-#   - Headset connected  → BTD-800 as default sink + source
-#   - Headset disconnected → S/PDIF speakers as default sink
+# Routes PipeWire default sink + source by a priority ladder of headsets,
+# detecting each headset's link state via HID reports from its USB dongle:
 #
-# The BTD-800 dongle handles Bluetooth internally. PipeWire/ALSA never
-# see connection events. The dongle's HID interface (Report ID 1) sends
-# a vendor report on connect/disconnect. Byte 19 is the connection flag:
-#   0x01 = connected, 0x00 = disconnected.
+#   1. Jabra Evolve2 buds linked to Link 390 dongle  → Jabra sink + source
+#   2. else Sennheiser BTD-800 headset connected      → BTD-800 sink + source
+#   3. else                                           → S/PDIF speakers (sink only)
+#
+# Both dongles handle their wireless link internally — PipeWire/ALSA never see
+# the headset connect/disconnect, only the dongle. Each dongle's HID interface
+# emits a report on connect/disconnect:
+#   - BTD-800: vendor Report ID 1, byte 19 = connection flag (0x01/0x00)
+#   - Jabra:   Report ID 5, header "05 00 01 00 08 0d", byte 6 = 0x01/0x02
+#
+# Keeping the default SINK and SOURCE matched to the SAME device is the core
+# job — the OS and apps routinely mismatch headset speaker/mic on their own.
 #
 # Run interactively:  ./audio-switcher [-v|--verbose]
 # Install as service: ./install.sh
 
 set -euo pipefail
 
-# --- Constants ---
-BTD_USB_ID="usb-1395_Sennheiser_BTD_800_USB-00"    # stable USB vendor/product match pattern
+# --- Device Constants ---
+BTD_USB_ID="usb-1395_Sennheiser_BTD_800_USB-00"    # stable BTD-800 sink/source match pattern
 SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 
-# HID report parsing: vendor report ID 1, byte 19 = connection flag
+JABRA_SINK_MATCH="Jabra_Link_390"   # stable Jabra sink/source/card match (serial suffix varies)
+JABRA_VID="0b0e"                    # GN Netcom / Jabra USB vendor id (for hidraw discovery)
+
+# HID report parsing — BTD-800: vendor report ID 1, byte 19 = connection flag
 BTD_HID_REPORT_ID=1
 BTD_HID_CONNECT_BYTE=19  # 0-indexed within full report (including report ID byte)
+
+# HID report parsing — Jabra: report ID 5, header bytes 05 00 01 00 08 0d,
+# then byte index 6 = link flag (0x01 connected, 0x02 disconnected).
+JABRA_HID_REPORT_ID=5
 
 # PipeWire recovery: detect broken-pipe errors and restart PipeWire
 PW_ERROR_THRESHOLD=5         # broken-pipe errors in check window to trigger restart
@@ -34,23 +47,17 @@ PW_COOLDOWN_FILE="${XDG_RUNTIME_DIR}/audio-switcher-pw-cooldown"
 PW_NOTIFY_COOLDOWN_SECONDS=300  # max one restart notification per 5 minutes
 PW_NOTIFY_COOLDOWN_FILE="${XDG_RUNTIME_DIR}/audio-switcher-notify-cooldown"
 
-# State file: IPC between HID event loop and health check loop
-# (background subshells can't share variables — state file is simplest IPC)
-STATE_FILE="${XDG_RUNTIME_DIR}/audio-switcher-state"
+# State file: per-device connection state for priority resolution.
+# Format: key=value lines, e.g. "jabra=connected" / "btd=disconnected".
+# (Background subshells can't share variables — a state file is the simplest IPC.)
+# Overridable via environment so tests can point it at a temp file.
+STATE_FILE="${STATE_FILE:-${XDG_RUNTIME_DIR}/audio-switcher-state}"
 
 # Delays
 SETTLE_DELAY=0.3
 
 VERBOSE=false
 ACTION="daemon"
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -v|--verbose) VERBOSE=true; shift ;;
-        fix) ACTION="fix"; shift ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
 
 # --- Logging ---
 log() {
@@ -90,16 +97,15 @@ notify_pw_restart() {
     log "NOTIFY: PipeWire restart notification sent"
 }
 
-# --- Find BTD-800 hidraw device ---
+# --- hidraw discovery ---
+# Find a hidraw device by USB vendor:product (BTD-800) — walks sysfs.
 find_hidraw() {
     local hidraw
     for hidraw in /dev/hidraw*; do
         [[ -e "$hidraw" ]] || continue
         local vid pid
-        # Walk sysfs to match vendor/product
         local sysdev="/sys/class/hidraw/$(basename "$hidraw")/device"
         if [[ -d "$sysdev" ]]; then
-            # Try to find idVendor/idProduct in parent USB device
             vid=$(cat "$sysdev/../../idVendor" 2>/dev/null || true)
             pid=$(cat "$sysdev/../../idProduct" 2>/dev/null || true)
             if [[ "$vid" == "1395" && "$pid" == "002d" ]]; then
@@ -111,7 +117,26 @@ find_hidraw() {
     return 1
 }
 
-# --- BTD-800 PipeWire Device Discovery ---
+# Find the Jabra dongle's hidraw device by USB vendor id (device number is
+# unstable across re-plug, so discover by vid, not a fixed path).
+find_jabra_hidraw() {
+    local hidraw
+    for hidraw in /dev/hidraw*; do
+        [[ -e "$hidraw" ]] || continue
+        local vid
+        local sysdev="/sys/class/hidraw/$(basename "$hidraw")/device"
+        if [[ -d "$sysdev" ]]; then
+            vid=$(cat "$sysdev/../../idVendor" 2>/dev/null || true)
+            if [[ "$vid" == "$JABRA_VID" ]]; then
+                echo "$hidraw"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# --- PipeWire device discovery ---
 find_btd_sink() {
     pactl list sinks short 2>/dev/null | grep "$BTD_USB_ID" | awk '{print $2}' | head -1 || true
 }
@@ -120,10 +145,22 @@ find_btd_source() {
     pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1 || true
 }
 
-# --- BTD-800 Card Profile Management ---
-# Ensure the BTD-800 card profile includes mic input.
-# If active profile is output-only (e.g. "output:analog-stereo"), switch to
-# the variant with input (e.g. "output:analog-stereo+input:mono-fallback").
+find_jabra_sink() {
+    pactl list sinks short 2>/dev/null | grep "$JABRA_SINK_MATCH" | awk '{print $2}' | head -1 || true
+}
+
+find_jabra_source() {
+    pactl list sources short 2>/dev/null | grep "$JABRA_SINK_MATCH" | grep -v '\.monitor' | awk '{print $2}' | head -1 || true
+}
+
+find_jabra_card() {
+    pactl list cards short 2>/dev/null | grep "$JABRA_SINK_MATCH" | awk '{print $2}' | head -1 || true
+}
+
+# --- Card Profile Management ---
+# Ensure a card's active profile includes mic input. If output-only
+# (e.g. "output:analog-stereo"), switch to the "+input:mono-fallback" variant
+# so the device exposes a source to pair with its sink.
 ensure_btd_input_profile() {
     local card="alsa_card.${BTD_USB_ID}"
     local active_profile
@@ -136,105 +173,167 @@ ensure_btd_input_profile() {
         return
     fi
 
-    # If active profile already has input, nothing to do
     if [[ "$active_profile" == *"+input:"* ]]; then
-        debug "profile already includes input ($active_profile)"
+        debug "BTD profile already includes input ($active_profile)"
         return
     fi
 
-    # Switch to the same output profile but with mic input
     local with_input="${active_profile}+input:mono-fallback"
     if pactl set-card-profile "$card" "$with_input" 2>/dev/null; then
-        log "PROFILE: switched to $with_input (added mic input)"
+        log "PROFILE: BTD switched to $with_input (added mic input)"
     else
-        log "WARNING: failed to set profile $with_input"
+        log "WARNING: failed to set BTD profile $with_input"
     fi
 }
 
-# --- Core Logic ---
-apply_defaults() {
-    local connected="$1"
-    local current_sink current_source
+ensure_jabra_input_profile() {
+    local card
+    card=$(find_jabra_card)
+    if [[ -z "$card" ]]; then
+        log "WARNING: Jabra card not found, cannot set profile"
+        return
+    fi
 
+    local active_profile
+    active_profile=$(pactl list cards 2>/dev/null \
+        | sed -n "/Name: $card/,/^$/p" \
+        | grep "Active Profile:" | sed 's/.*: //' || true)
+
+    if [[ -z "$active_profile" ]]; then
+        return
+    fi
+
+    if [[ "$active_profile" == *"+input:"* ]]; then
+        debug "Jabra profile already includes input ($active_profile)"
+        return
+    fi
+
+    local with_input="${active_profile}+input:mono-fallback"
+    if pactl set-card-profile "$card" "$with_input" 2>/dev/null; then
+        log "PROFILE: Jabra switched to $with_input (added mic input)"
+    else
+        log "WARNING: failed to set Jabra profile $with_input"
+    fi
+}
+
+# --- State File IPC (per-device) ---
+set_device_state() {
+    local device="$1" state="$2"
+    local tmp
+    tmp=$(mktemp "${STATE_FILE}.XXXXXX")
+    # Preserve other devices' lines; replace this device's line.
+    if [[ -f "$STATE_FILE" ]]; then
+        grep -v "^${device}=" "$STATE_FILE" > "$tmp" 2>/dev/null || true
+    fi
+    echo "${device}=${state}" >> "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+}
+
+get_device_state() {
+    local device="$1" line=""
+    [[ -f "$STATE_FILE" ]] && line=$(grep "^${device}=" "$STATE_FILE" 2>/dev/null | tail -1)
+    if [[ -n "$line" ]]; then
+        echo "${line#*=}"
+    else
+        echo "disconnected"
+    fi
+}
+
+# Resolve the highest-priority connected device: jabra > btd > none.
+resolve_active_device() {
+    if [[ "$(get_device_state jabra)" == "connected" ]]; then
+        echo "jabra"
+    elif [[ "$(get_device_state btd)" == "connected" ]]; then
+        echo "btd"
+    else
+        echo "none"
+    fi
+}
+
+# --- Routing ---
+# Set default sink AND source to a matched pair, logging changes only.
+apply_sink_source() {
+    local label="$1" sink="$2" source="$3" cur_sink="$4" cur_source="$5"
+
+    if [[ -z "$sink" ]]; then
+        log "WARNING: $label sink not found by PipeWire (not enumerated yet?)"
+    elif [[ "$cur_sink" != "$sink" ]]; then
+        if pactl set-default-sink "$sink" 2>/dev/null; then
+            log "SWITCH sink → $label ($sink)"
+        else
+            log "ERROR: failed to set $label as default sink ($sink)"
+        fi
+    else
+        debug "sink already $label ($sink), no change"
+    fi
+
+    if [[ -z "$source" ]]; then
+        log "WARNING: $label source not found by PipeWire (not enumerated yet?)"
+    elif [[ "$cur_source" != "$source" ]]; then
+        if pactl set-default-source "$source" 2>/dev/null; then
+            log "SWITCH source → $label ($source)"
+        else
+            log "ERROR: failed to set $label as default source ($source)"
+        fi
+    else
+        debug "source already $label ($source), no change"
+    fi
+}
+
+# Fall back to S/PDIF speakers (output only — no matching mic; leave source).
+# Retries to ride out PipeWire re-enumeration after a restart/resume.
+apply_spdif_sink() {
+    local current_sink="$1"
+    if [[ "$current_sink" == "$SPDIF_SINK" ]]; then
+        debug "sink already S/PDIF, no change"
+        return
+    fi
+    local attempts=0 max_attempts=5
+    while (( attempts < max_attempts )); do
+        if pactl set-default-sink "$SPDIF_SINK" 2>/dev/null; then
+            log "SWITCH sink → S/PDIF speakers"
+            return
+        fi
+        (( attempts++ ))
+        if (( attempts < max_attempts )); then
+            debug "S/PDIF sink not available, retrying ($attempts/$max_attempts)..."
+            sleep 1
+        fi
+    done
+    log "ERROR: failed to set S/PDIF as default sink after $max_attempts attempts"
+}
+
+# Resolve the priority ladder and apply the winner's matched sink+source.
+apply_priority() {
+    local active current_sink current_source
+    active=$(resolve_active_device)
     current_sink=$(pactl get-default-sink 2>/dev/null || true)
     current_source=$(pactl get-default-source 2>/dev/null || true)
 
-    if [[ "$connected" == "true" ]]; then
-        # Ensure card profile includes mic input before discovering devices
-        ensure_btd_input_profile
-
-        # Headset connected → discover BTD-800 sink/source dynamically
-        local btd_sink btd_source
-        btd_sink=$(find_btd_sink)
-        btd_source=$(find_btd_source)
-
-        if [[ -z "$btd_sink" ]]; then
-            log "WARNING: BTD-800 sink not found by PipeWire (device not enumerated yet?)"
-        elif [[ "$current_sink" != "$btd_sink" ]]; then
-            if pactl set-default-sink "$btd_sink" 2>/dev/null; then
-                log "SWITCH sink → BTD-800 headset ($btd_sink)"
-            else
-                log "ERROR: failed to set BTD-800 as default sink ($btd_sink)"
-            fi
-        else
-            debug "sink already BTD-800 ($btd_sink), no change"
-        fi
-
-        if [[ -z "$btd_source" ]]; then
-            log "WARNING: BTD-800 source not found by PipeWire (device not enumerated yet?)"
-        elif [[ "$current_source" != "$btd_source" ]]; then
-            if pactl set-default-source "$btd_source" 2>/dev/null; then
-                log "SWITCH source → BTD-800 mic ($btd_source)"
-            else
-                log "ERROR: failed to set BTD-800 as default source ($btd_source)"
-            fi
-        else
-            debug "source already BTD-800 ($btd_source), no change"
-        fi
-    else
-        # Headset disconnected → S/PDIF fallback (with retry for PipeWire re-enumeration)
-        if [[ "$current_sink" != "$SPDIF_SINK" ]]; then
-            local attempts=0 max_attempts=5
-            while (( attempts < max_attempts )); do
-                if pactl set-default-sink "$SPDIF_SINK" 2>/dev/null; then
-                    log "SWITCH sink → S/PDIF speakers"
-                    break
-                fi
-                (( attempts++ ))
-                if (( attempts < max_attempts )); then
-                    debug "S/PDIF sink not available, retrying ($attempts/$max_attempts)..."
-                    sleep 1
-                fi
-            done
-            if (( attempts == max_attempts )); then
-                log "ERROR: failed to set S/PDIF as default sink after $max_attempts attempts"
-            fi
-        else
-            debug "sink already S/PDIF, no change"
-        fi
-        # No explicit fallback source — let PipeWire choose
-    fi
+    case "$active" in
+        jabra)
+            ensure_jabra_input_profile
+            apply_sink_source "Jabra buds" "$(find_jabra_sink)" "$(find_jabra_source)" \
+                "$current_sink" "$current_source"
+            ;;
+        btd)
+            ensure_btd_input_profile
+            apply_sink_source "BTD-800 headset" "$(find_btd_sink)" "$(find_btd_source)" \
+                "$current_sink" "$current_source"
+            ;;
+        none)
+            apply_spdif_sink "$current_sink"
+            ;;
+    esac
 }
 
 show_status() {
     local default_sink default_source
     default_sink=$(pactl get-default-sink 2>/dev/null || echo "(unknown)")
     default_source=$(pactl get-default-source 2>/dev/null || echo "(unknown)")
+    log "  Active device:  $(resolve_active_device)"
     log "  Default sink:   $default_sink"
     log "  Default source: $default_source"
-}
-
-# --- State File IPC ---
-write_state() {
-    echo "$1" > "$STATE_FILE"
-}
-
-read_state() {
-    if [[ -f "$STATE_FILE" ]]; then
-        cat "$STATE_FILE"
-    else
-        echo "unknown"
-    fi
 }
 
 # --- Hunt Mode State ---
@@ -254,7 +353,6 @@ check_pipewire_health() {
 
     read_cooldown_state
 
-    # In normal mode, check cooldown — don't restart too frequently
     if [[ "$CURRENT_MODE" == "normal" && "$LAST_RESTART" -gt 0 ]]; then
         local now
         now=$(date +%s)
@@ -262,9 +360,7 @@ check_pipewire_health() {
             return 0
         fi
     fi
-    # In hunt mode, no cooldown — always check
 
-    # Count broken-pipe errors in the check window
     local error_count
     error_count=$(journalctl --user -u pipewire --since "-${PW_CHECK_WINDOW}" --no-pager 2>/dev/null \
         | grep -c "Broken pipe" || true)
@@ -273,19 +369,12 @@ check_pipewire_health() {
         log "PW-RECOVERY: $error_count broken-pipe errors in last ${PW_CHECK_WINDOW} (mode=$CURRENT_MODE, threshold=$threshold), restarting PipeWire"
         systemctl --user restart pipewire pipewire-pulse wireplumber
 
-        # Enter/stay in hunt mode
         echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
 
-        # Give PipeWire time to enumerate devices, then re-apply correct defaults
+        # Give PipeWire time to enumerate devices, then re-apply correct defaults.
         sleep 2
-        local state
-        state=$(read_state)
-        if [[ "$state" == "connected" ]]; then
-            apply_defaults true
-        else
-            apply_defaults false
-        fi
-        log "PW-RECOVERY: defaults re-applied (state=$state)"
+        apply_priority
+        log "PW-RECOVERY: defaults re-applied (active=$(resolve_active_device))"
         show_status
         notify_pw_restart "PipeWire restarted ($error_count broken pipe errors)"
     fi
@@ -302,7 +391,6 @@ pipewire_health_loop() {
             local now
             now=$(date +%s)
             if (( now - LAST_RESTART >= PW_HUNT_DURATION )); then
-                # Hunt expired — back to normal with cooldown
                 log "HUNT: ${PW_HUNT_DURATION}s clean, returning to normal mode"
                 echo "$(date +%s) normal" > "$PW_COOLDOWN_FILE"
             else
@@ -317,9 +405,8 @@ pipewire_health_loop() {
 }
 
 # --- Sleep/Resume Monitor ---
-# Watches systemd-logind D-Bus signal for resume events.
-# On wake from sleep, re-applies defaults and runs rapid health checks
-# (PipeWire streams often break when USB devices lose power during suspend).
+# On wake from sleep, re-applies defaults and enters hunt mode (PipeWire
+# streams often break when USB devices lose power during suspend).
 sleep_resume_loop() {
     gdbus monitor --system --dest org.freedesktop.login1 \
         --object-path /org/freedesktop/login1 2>/dev/null \
@@ -327,20 +414,17 @@ sleep_resume_loop() {
         if [[ "$line" == *"PrepareForSleep"*"false"* ]]; then
             log "RESUME: system woke from sleep, re-applying defaults"
             sleep 2  # give PipeWire a moment to re-enumerate devices
-            local state
-            state=$(read_state)
-            apply_defaults "$([ "$state" = "connected" ] && echo true || echo false)"
+            apply_priority
             show_status
-            # Enter hunt mode — USB devices often break after resume
             log "RESUME: entering hunt mode for post-resume monitoring"
             echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
         fi
     done
 }
 
-# --- HID Monitor ---
-# Reads BTD-800 hidraw device and calls apply_defaults on connection changes.
-# Uses a small Python helper for binary HID report parsing.
+# --- HID Monitors ---
+# Each emits 'connected' / 'disconnected' lines on stdout; the event loop
+# prefixes them with the device tag.
 monitor_hidraw() {
     local hidraw="$1"
     python3 -u -c "
@@ -360,7 +444,6 @@ try:
             report_id = data[0]
             if report_id == REPORT_ID and len(data) > CONNECT_BYTE:
                 connected = data[CONNECT_BYTE]
-                # Output: 'connected' or 'disconnected'
                 if connected:
                     print('connected', flush=True)
                 else:
@@ -372,44 +455,100 @@ finally:
 " 2>&1
 }
 
-# --- Main Event Loop ---
-event_loop() {
+# Jabra: match Report ID 5 with header 05 00 01 00 08 0d, then byte[6]:
+#   0x01 = buds connected, 0x02 = buds disconnected.
+# (Lookalike reports begin "05 00 04 .." and also contain 08 0d — the full
+# header match rejects them.)
+monitor_jabra_hidraw() {
     local hidraw="$1"
+    python3 -u -c "
+import os, select, sys
 
+fd = os.open('$hidraw', os.O_RDONLY)
+try:
+    while True:
+        r, _, _ = select.select([fd], [], [])
+        if r:
+            data = os.read(fd, 256)
+            if not data:
+                break
+            if (len(data) >= 10 and data[0] == 0x05 and data[1] == 0x00
+                    and data[2] == 0x01 and data[3] == 0x00
+                    and data[4] == 0x08 and data[5] == 0x0d):
+                flag = data[6]
+                if flag == 0x01:
+                    print('connected', flush=True)
+                elif flag == 0x02:
+                    print('disconnected', flush=True)
+except Exception as e:
+    print(f'error:{e}', file=sys.stderr, flush=True)
+finally:
+    os.close(fd)
+" 2>&1
+}
+
+# --- Main Event Loop ---
+# Discovers both dongles' hidraw devices and monitors whichever are present
+# concurrently, merging their tagged events. Any subset of dongles may be
+# absent. On a device event, update its state, re-resolve the priority ladder,
+# and apply the matched defaults.
+handle_event() {
+    local device="$1" state="$2"
+    case "$state" in
+        connected)
+            log "EVENT: $device connected"
+            sleep "$SETTLE_DELAY"
+            set_device_state "$device" connected
+            apply_priority
+            show_status
+            # Newly connected devices are prone to broken pipes — enter hunt mode.
+            log "HUNT: entering hunt mode after $device connect"
+            echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
+            ;;
+        disconnected)
+            log "EVENT: $device disconnected"
+            sleep "$SETTLE_DELAY"
+            set_device_state "$device" disconnected
+            apply_priority
+            show_status
+            ;;
+    esac
+}
+
+event_loop() {
     while true; do
-        log "Starting HID monitor on $hidraw..."
+        local btd_hidraw jabra_hidraw
+        btd_hidraw=$(find_hidraw 2>/dev/null || true)
+        jabra_hidraw=$(find_jabra_hidraw 2>/dev/null || true)
+
+        if [[ -z "$btd_hidraw" && -z "$jabra_hidraw" ]]; then
+            debug "No headset dongles found; re-checking in 10s"
+            sleep 10
+            continue
+        fi
+
+        log "Starting HID monitors (btd=${btd_hidraw:-none} jabra=${jabra_hidraw:-none})"
         show_status
 
         while IFS= read -r event; do
             case "$event" in
-                connected)
-                    log "EVENT: headset connected"
-                    sleep "$SETTLE_DELAY"
-                    write_state "connected"
-                    apply_defaults true
-                    show_status
-                    # Enter hunt mode — newly connected devices are prone to broken pipes
-                    log "HUNT: entering hunt mode after headset connect"
-                    echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
-                    ;;
-                disconnected)
-                    log "EVENT: headset disconnected"
-                    sleep "$SETTLE_DELAY"
-                    write_state "disconnected"
-                    apply_defaults false
-                    show_status
-                    ;;
-                error:*)
-                    log "HID error: ${event#error:}"
-                    ;;
-                *)
-                    debug "unknown event: $event"
-                    ;;
+                btd:connected)     handle_event btd connected ;;
+                btd:disconnected)  handle_event btd disconnected ;;
+                jabra:connected)   handle_event jabra connected ;;
+                jabra:disconnected) handle_event jabra disconnected ;;
+                *:error:*)         log "HID error: ${event#*error:}" ;;
+                *)                 debug "unknown event: $event" ;;
             esac
-        done < <(monitor_hidraw "$hidraw")
+        done < <(
+            {
+                [[ -n "$btd_hidraw" ]] && monitor_hidraw "$btd_hidraw" | sed -u 's/^/btd:/' &
+                [[ -n "$jabra_hidraw" ]] && monitor_jabra_hidraw "$jabra_hidraw" | sed -u 's/^/jabra:/' &
+                wait
+            }
+        )
 
-        # monitor_hidraw exited — device may have been unplugged
-        log "HID monitor disconnected, waiting 2s before retrying..."
+        # Monitor(s) exited — a dongle was likely unplugged. Re-discover.
+        log "HID monitor(s) exited, waiting 2s before re-discovering..."
         sleep 2
     done
 }
@@ -419,7 +558,6 @@ cleanup() {
     trap - SIGTERM SIGINT
     echo ""
     log "Shutting down audio-switcher"
-    # Kill health loop, sleep monitor, and any other background jobs
     if [[ -n "${HEALTH_PID:-}" ]]; then
         kill "$HEALTH_PID" 2>/dev/null || true
     fi
@@ -427,12 +565,9 @@ cleanup() {
         kill "$SLEEP_PID" 2>/dev/null || true
     fi
     jobs -p | xargs -r kill 2>/dev/null || true
-    # Clean up runtime files
     rm -f "$STATE_FILE" "$PW_COOLDOWN_FILE" "$PW_NOTIFY_COOLDOWN_FILE"
     exit 0
 }
-
-trap cleanup SIGTERM SIGINT
 
 # --- Fix Subcommand ---
 do_fix() {
@@ -444,9 +579,7 @@ do_fix() {
         log "FIX: $error_count broken-pipe errors in last 120s, restarting PipeWire"
         systemctl --user restart pipewire pipewire-pulse wireplumber
         sleep 2
-        local state
-        state=$(read_state)
-        apply_defaults "$([ "$state" = "connected" ] && echo true || echo false)"
+        apply_priority
         log "FIX: recovery complete"
         show_status
         notify_pw_restart "Manual fix: PipeWire restarted ($error_count broken pipe errors)"
@@ -458,43 +591,47 @@ do_fix() {
 }
 
 # --- Main ---
-if [[ "$ACTION" == "fix" ]]; then
-    do_fix
-    exit 0
-fi
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose) VERBOSE=true; shift ;;
+            fix) ACTION="fix"; shift ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
 
-log "audio-switcher starting (verbose=$VERBOSE)"
-log "  BTD-800 match:   *${BTD_USB_ID}*"
-log "  BTD-800 sink:    $(find_btd_sink)"
-log "  BTD-800 source:  $(find_btd_source)"
-log "  S/PDIF fallback: $SPDIF_SINK"
+    trap cleanup SIGTERM SIGINT
 
-# Find the hidraw device
-HIDRAW=$(find_hidraw) || {
-    log "ERROR: BTD-800 hidraw device not found. Is the dongle plugged in?"
-    log "  Ensure a udev rule grants access: see install.sh"
-    exit 1
+    if [[ "$ACTION" == "fix" ]]; then
+        do_fix
+        exit 0
+    fi
+
+    log "audio-switcher starting (verbose=$VERBOSE)"
+    log "  Priority:        Jabra buds > BTD-800 > S/PDIF"
+    log "  BTD-800 match:   *${BTD_USB_ID}*"
+    log "  Jabra match:     *${JABRA_SINK_MATCH}*"
+    log "  S/PDIF fallback: $SPDIF_SINK"
+    log "  BTD-800 hidraw:  $(find_hidraw 2>/dev/null || echo '(not present)')"
+    log "  Jabra hidraw:    $(find_jabra_hidraw 2>/dev/null || echo '(not present)')"
+
+    echo ""
+
+    # Start PipeWire health monitor in background
+    pipewire_health_loop &
+    HEALTH_PID=$!
+    log "  PW health monitor PID: $HEALTH_PID"
+
+    # Start sleep/resume monitor in background
+    sleep_resume_loop &
+    SLEEP_PID=$!
+    log "  Sleep/resume monitor PID: $SLEEP_PID"
+
+    event_loop
 }
-log "  HID device:      $HIDRAW"
 
-# Check read access
-if [[ ! -r "$HIDRAW" ]]; then
-    log "ERROR: Cannot read $HIDRAW (permission denied)"
-    log "  Install the udev rule: sudo cp 70-btd800.rules /etc/udev/rules.d/"
-    log "  Then: sudo udevadm control --reload-rules && sudo udevadm trigger"
-    exit 1
+# Only run main when executed directly — sourcing (e.g. from tests) just loads
+# the functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
 fi
-
-echo ""
-
-# Start PipeWire health monitor in background
-pipewire_health_loop &
-HEALTH_PID=$!
-log "  PW health monitor PID: $HEALTH_PID"
-
-# Start sleep/resume monitor in background
-sleep_resume_loop &
-SLEEP_PID=$!
-log "  Sleep/resume monitor PID: $SLEEP_PID"
-
-event_loop "$HIDRAW"

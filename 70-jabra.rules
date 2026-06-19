@@ -1,0 +1,5 @@
+# Grant logged-in user read access to the Jabra Link 390 USB dongle HID interface.
+# Required for audio-switcher to detect Evolve2 bud link state via hidraw.
+# Install: sudo cp 70-jabra.rules /etc/udev/rules.d/
+# Reload: sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b0e", ATTRS{idProduct}=="2e50", TAG+="uaccess"
