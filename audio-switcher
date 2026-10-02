@@ -28,6 +28,10 @@ SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 
 JABRA_SINK_MATCH="Jabra_Link_390"   # stable Jabra sink/source/card match (serial suffix varies)
 JABRA_VID="0b0e"                    # GN Netcom / Jabra USB vendor id (for hidraw discovery)
+# The Link 390 exposes an "iec958" (digital passthrough) output that WirePlumber
+# prefers by priority but which is SILENT on the buds. Force the analog output
+# plus the mono mic input whenever the buds are the active device.
+JABRA_PROFILE="output:analog-stereo+input:mono-fallback"
 
 # HID report parsing — BTD-800: vendor report ID 1, byte 19 = connection flag
 BTD_HID_REPORT_ID=1
@@ -145,8 +149,28 @@ find_btd_source() {
     pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1 || true
 }
 
+# Prefer the analog-stereo sink: right after a profile switch PipeWire can
+# transiently list the old iec958 sink alongside the new analog one.
 find_jabra_sink() {
-    pactl list sinks short 2>/dev/null | grep "$JABRA_SINK_MATCH" | awk '{print $2}' | head -1 || true
+    local sinks
+    sinks=$(pactl list sinks short 2>/dev/null | grep "$JABRA_SINK_MATCH" | awk '{print $2}' || true)
+    { grep 'analog-stereo' <<< "$sinks"; echo "$sinks"; } | grep -v '^$' | head -1 || true
+}
+
+# Poll for the Jabra sink: a profile switch tears down and re-creates the
+# sink, so an immediate lookup after ensure_jabra_input_profile can miss it.
+wait_for_jabra_sink() {
+    local attempts=0 max_attempts=10 sink
+    while (( attempts < max_attempts )); do
+        sink=$(find_jabra_sink)
+        if [[ -n "$sink" ]]; then
+            echo "$sink"
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.3
+    done
+    return 1
 }
 
 find_jabra_source() {
@@ -186,6 +210,9 @@ ensure_btd_input_profile() {
     fi
 }
 
+# Force the Jabra card onto JABRA_PROFILE (analog output + mono mic). Unlike
+# the BTD-800, "any profile with input" is NOT good enough here: the iec958
+# output variant has a mic but no audible speaker path.
 ensure_jabra_input_profile() {
     local card
     card=$(find_jabra_card)
@@ -203,16 +230,15 @@ ensure_jabra_input_profile() {
         return
     fi
 
-    if [[ "$active_profile" == *"+input:"* ]]; then
-        debug "Jabra profile already includes input ($active_profile)"
+    if [[ "$active_profile" == "$JABRA_PROFILE" ]]; then
+        debug "Jabra profile already $JABRA_PROFILE"
         return
     fi
 
-    local with_input="${active_profile}+input:mono-fallback"
-    if pactl set-card-profile "$card" "$with_input" 2>/dev/null; then
-        log "PROFILE: Jabra switched to $with_input (added mic input)"
+    if pactl set-card-profile "$card" "$JABRA_PROFILE" 2>/dev/null; then
+        log "PROFILE: Jabra switched $active_profile → $JABRA_PROFILE (analog out + mic)"
     else
-        log "WARNING: failed to set Jabra profile $with_input"
+        log "WARNING: failed to set Jabra profile $JABRA_PROFILE"
     fi
 }
 
@@ -294,7 +320,7 @@ apply_spdif_sink() {
             log "SWITCH sink → S/PDIF speakers"
             return
         fi
-        (( attempts++ ))
+        attempts=$((attempts + 1))
         if (( attempts < max_attempts )); then
             debug "S/PDIF sink not available, retrying ($attempts/$max_attempts)..."
             sleep 1
@@ -313,7 +339,9 @@ apply_priority() {
     case "$active" in
         jabra)
             ensure_jabra_input_profile
-            apply_sink_source "Jabra buds" "$(find_jabra_sink)" "$(find_jabra_source)" \
+            local jabra_sink
+            jabra_sink=$(wait_for_jabra_sink || true)
+            apply_sink_source "Jabra buds" "$jabra_sink" "$(find_jabra_source)" \
                 "$current_sink" "$current_source"
             ;;
         btd)

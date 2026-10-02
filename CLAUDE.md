@@ -64,6 +64,7 @@ Background subshells in bash can't share variables. The state file (`$XDG_RUNTIM
 | `BTD_USB_ID` | `usb-1395_Sennheiser_BTD_800_USB-00` | Match pattern for BTD-800 sink/source (stable across profile changes) |
 | `JABRA_SINK_MATCH` | `Jabra_Link_390` | Match pattern for Jabra sink/source/card |
 | `JABRA_VID` | `0b0e` | Jabra/GN Netcom USB vendor id (hidraw discovery) |
+| `JABRA_PROFILE` | `output:analog-stereo+input:mono-fallback` | Card profile forced on Jabra connect. WirePlumber prefers the `iec958` output by priority, which is **silent** on the buds |
 | `SPDIF_SINK` | `alsa_output.pci-0000_00_1f.3.iec958-stereo` | Motherboard S/PDIF (stable) |
 
 Sink/source names are **discovered at runtime** (`find_btd_sink/source`, `find_jabra_sink/source`). The Jabra name carries the dongle serial and can gain a suffix on re-plug (e.g. `…99AB` → `…99AB2`), so matching is by the `JABRA_SINK_MATCH` pattern, never the exact string.
@@ -83,7 +84,9 @@ Sink/source names are **discovered at runtime** (`find_btd_sink/source`, `find_j
 | `find_hidraw()` / `find_jabra_hidraw()` | Scan /dev/hidraw* for BTD-800 (vid:pid) / Jabra (vid `0b0e`) |
 | `find_btd_sink/source()` / `find_jabra_sink/source()` | Discover sink/source names from PipeWire by match pattern |
 | `find_jabra_card()` | Discover Jabra card name (for profile management) |
-| `ensure_btd_input_profile()` / `ensure_jabra_input_profile()` | Switch card to a profile with mic input if output-only |
+| `ensure_btd_input_profile()` | Switch BTD card to a profile with mic input if output-only |
+| `ensure_jabra_input_profile()` | Force Jabra card to exactly `JABRA_PROFILE` (any other profile, incl. iec958+input, is replaced) |
+| `wait_for_jabra_sink()` | Poll for the Jabra sink after a profile switch re-creates it (used by `apply_priority`) |
 | `monitor_hidraw()` / `monitor_jabra_hidraw()` | Read HID reports via embedded Python, emit connected/disconnected |
 | `event_loop()` | Discover + monitor both dongles concurrently; merge tagged events → `handle_event()` |
 | `handle_event(device, state)` | Update device state, re-resolve priority, apply, hunt-mode on connect |
@@ -135,7 +138,7 @@ fi
 
 Categories:
 - **Static checks** — Script exists, executable, shebang, constants, functions (HID + recovery + state + Jabra + priority)
-- **Unit checks** — Source the daemon (guarded `main()`) and call functions directly: `resolve_active_device` truth table (jabra×btd combos) and the `monitor_jabra_hidraw` parser (connect/disconnect/lookalike).
+- **Unit checks** — Source the daemon (guarded `main()`) and call functions directly: `resolve_active_device` truth table (jabra×btd combos), the `monitor_jabra_hidraw` parser (connect/disconnect/lookalike), and the Jabra profile enforcer / sink lookup against a stubbed `pactl` shell function (define `pactl() { … }` after sourcing to fake PipeWire).
 - **Installation checks** — Binary installed, service file exists, enabled, active; both udev rules
 - **Runtime checks** — Default sink/source matches the priority resolution (jabra → btd → S/PDIF)
 

@@ -34,6 +34,8 @@ The Jabra signature was reverse-engineered with `diag-jabra.sh` (header match re
 
 Sink/source names vary by active card profile and (for the Jabra) can gain a serial suffix on re-plug, so the daemon discovers them dynamically by pattern on each event.
 
+On every Jabra connect the daemon forces the Link 390 card to the `output:analog-stereo+input:mono-fallback` profile. WirePlumber otherwise picks the higher-priority `iec958` (digital passthrough) output, which produces no sound on the buds.
+
 > **Pairing the Jabra buds to the dongle is a one-time Windows/Mac step** (Jabra Direct) — the Link 390 presents to Linux only as USB audio + HID, not a Bluetooth controller, so BlueZ can't pair it. Once paired, the dongle remembers the buds and it's plug-and-play on Linux.
 
 ## Install

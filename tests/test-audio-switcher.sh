@@ -342,6 +342,95 @@ assert_eq "parser: 05 00 04 lookalike ignored" "$(jabra_parse 05000451080d010a09
 
 echo ""
 
+# --- Unit: Jabra card profile enforcement ---
+# The Link 390 exposes both an "iec958" (digital passthrough) and an
+# "analog-stereo" output. WirePlumber picks iec958 by priority, which is
+# SILENT on the buds. The daemon must force the analog+mic profile on connect.
+echo "--- Unit: ensure_jabra_input_profile ---"
+
+JABRA_WANT_PROFILE="output:analog-stereo+input:mono-fallback"
+JABRA_TEST_CARD="alsa_card.usb-_Jabra_Link_390_6CFBED6C99AB2-00"
+
+if grep -q "JABRA_PROFILE=\"$JABRA_WANT_PROFILE\"" "$DAEMON" 2>/dev/null; then
+    test_result "JABRA_PROFILE constant is analog-stereo + mono input" "pass"
+else
+    test_result "JABRA_PROFILE constant is analog-stereo + mono input" "fail"
+fi
+
+# jabra_profile_run <active-profile> -> echoes "<card> <profile>" for each
+# set-card-profile call the daemon issued against a stubbed pactl ("" if none)
+jabra_profile_run() {
+    local calls
+    calls=$(mktemp)
+    STATE_FILE=/dev/null CALLS="$calls" ACTIVE="$1" CARD="$JABRA_TEST_CARD" bash -c '
+        source "'"$DAEMON"'"
+        pactl() {
+            case "$1 $2 ${3:-}" in
+                "list cards short")   printf "99\t%s\talsa\n" "$CARD" ;;
+                "list cards ")        printf "Card #99\n\tName: %s\n\tActive Profile: %s\n\n" "$CARD" "$ACTIVE" ;;
+                "set-card-profile "*) echo "$2 $3" >> "$CALLS" ;;
+            esac
+        }
+        ensure_jabra_input_profile >/dev/null
+    ' 2>/dev/null
+    cat "$calls"
+    rm -f "$calls"
+}
+
+assert_eq "profile: iec958+input is switched to analog+input" \
+    "$(jabra_profile_run 'output:iec958-stereo+input:mono-fallback')" \
+    "$JABRA_TEST_CARD $JABRA_WANT_PROFILE"
+assert_eq "profile: analog output-only is switched to analog+input" \
+    "$(jabra_profile_run 'output:analog-stereo')" \
+    "$JABRA_TEST_CARD $JABRA_WANT_PROFILE"
+assert_eq "profile: analog+input left alone" \
+    "$(jabra_profile_run "$JABRA_WANT_PROFILE")" \
+    ""
+
+# find_jabra_sink prefers the analog sink when PipeWire still lists both
+# (transiently true right after a profile switch).
+jabra_sink_pick() {
+    STATE_FILE=/dev/null bash -c '
+        source "'"$DAEMON"'"
+        pactl() {
+            printf "1\talsa_output.usb-_Jabra_Link_390_X-00.iec958-stereo\tPipeWire\n"
+            printf "2\talsa_output.usb-_Jabra_Link_390_X-00.analog-stereo\tPipeWire\n"
+        }
+        find_jabra_sink
+    ' 2>/dev/null
+}
+assert_eq "find_jabra_sink prefers analog-stereo over iec958" \
+    "$(jabra_sink_pick)" "alsa_output.usb-_Jabra_Link_390_X-00.analog-stereo"
+
+# wait_for_jabra_sink polls until the (re-created) sink appears.
+jabra_sink_wait() {
+    local counter
+    counter=$(mktemp)
+    echo 0 > "$counter"
+    STATE_FILE=/dev/null COUNTER="$counter" bash -c '
+        source "'"$DAEMON"'"
+        pactl() {
+            local n; n=$(cat "$COUNTER"); echo $((n+1)) > "$COUNTER"
+            (( n >= 2 )) && printf "2\talsa_output.usb-_Jabra_Link_390_X-00.analog-stereo\tPipeWire\n"
+            return 0
+        }
+        wait_for_jabra_sink
+    ' 2>/dev/null
+    rm -f "$counter"
+}
+assert_eq "wait_for_jabra_sink returns sink once it appears" \
+    "$(jabra_sink_wait)" "alsa_output.usb-_Jabra_Link_390_X-00.analog-stereo"
+
+# apply_priority must use the waiting lookup in the jabra branch (the profile
+# switch re-creates the sink, so an immediate lookup can miss it).
+if sed -n '/^apply_priority()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'wait_for_jabra_sink'; then
+    test_result "apply_priority waits for the Jabra sink after profile switch" "pass"
+else
+    test_result "apply_priority waits for the Jabra sink after profile switch" "fail"
+fi
+
+echo ""
+
 # --- Installation Checks ---
 echo "--- Installation Checks ---"
 
