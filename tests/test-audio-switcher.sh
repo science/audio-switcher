@@ -121,6 +121,53 @@ for func in find_jabra_hidraw find_jabra_sink find_jabra_source monitor_jabra_hi
     fi
 done
 
+# --- Jabra mic probe static checks ---
+for const in JABRA_SOURCE_VOLUME JABRA_PROBE_DELAY JABRA_PROBE_SKIP JABRA_PROBE_LISTEN \
+             JABRA_PROBE_RETRY_DELAY JABRA_PROBE_MIN_NONZERO_PCT JABRA_PROBE_VOLUME_SETTLE \
+             JABRA_PROBE_ALERT_COOLDOWN JABRA_ALERT_COOLDOWN_FILE JABRA_ALERT_FLAG_FILE; do
+    if grep -q "^${const}=" "$DAEMON" 2>/dev/null; then
+        test_result "${const} constant present" "pass"
+    else
+        test_result "${const} constant present" "fail"
+    fi
+done
+
+for func in jabra_mic_verdict record_jabra_mic jabra_probe_source jabra_mic_state \
+            ensure_jabra_mic_live probe_jabra_mic_once probe_jabra_mic \
+            start_jabra_probe stop_jabra_probe do_probe_mic; do
+    if grep -q "^${func}()" "$DAEMON" 2>/dev/null; then
+        test_result "${func}() function defined" "pass"
+    else
+        test_result "${func}() function defined" "fail"
+    fi
+done
+
+# handle_event starts a probe on Jabra connect and cancels it on disconnect
+if sed -n '/^handle_event()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'start_jabra_probe'; then
+    test_result "handle_event starts the mic probe on Jabra connect" "pass"
+else
+    test_result "handle_event starts the mic probe on Jabra connect" "fail"
+fi
+if sed -n '/^handle_event()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'stop_jabra_probe'; then
+    test_result "handle_event cancels the mic probe on Jabra disconnect" "pass"
+else
+    test_result "handle_event cancels the mic probe on Jabra disconnect" "fail"
+fi
+
+# probe-mic subcommand
+if grep -q 'probe-mic)' "$DAEMON" 2>/dev/null; then
+    test_result "probe-mic subcommand handled in argument parsing" "pass"
+else
+    test_result "probe-mic subcommand handled in argument parsing" "fail"
+fi
+
+# cleanup removes the mic-alert runtime files
+if grep 'rm -f' "$DAEMON" 2>/dev/null | grep -q 'JABRA_ALERT_FLAG_FILE'; then
+    test_result "cleanup removes JABRA_ALERT_FLAG_FILE" "pass"
+else
+    test_result "cleanup removes JABRA_ALERT_FLAG_FILE" "fail"
+fi
+
 # --- Priority routing functions ---
 for func in resolve_active_device apply_priority apply_spdif_sink set_device_state get_device_state; do
     if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
@@ -428,6 +475,227 @@ if sed -n '/^apply_priority()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'wait_for_
 else
     test_result "apply_priority waits for the Jabra sink after profile switch" "fail"
 fi
+
+echo ""
+
+# --- Unit: Jabra mic probe ---
+echo "--- Unit: Jabra mic probe ---"
+
+# Synthetic 48 kHz mono s16 recordings shaped like the real 2026-10-09 takes.
+PROBE_TMP=$(mktemp -d)
+python3 - "$PROBE_TMP" <<'PY'
+import array, math, random, sys, wave
+d, sr = sys.argv[1], 48000
+n = int(6.5 * sr)
+def write(name, samples):
+    w = wave.open(f"{d}/{name}.wav", "wb")
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+    w.writeframes(array.array("h", samples).tobytes())
+    w.close()
+random.seed(1)
+# Stuck bud: nothing but exact zeros.
+write("dead", [0] * n)
+# Stuck bud plus one 20 ms click (the hw mute switch flip seen in j2.wav).
+click = [0] * n
+for i in range(3 * sr, 3 * sr + sr // 50):
+    click[i] = 600 if i % 2 else -600
+write("click", click)
+# Working bud in a silent room: ~0.9 s of startup zeros, then a faint noise
+# floor of +/-3 with ~15% exact zeros scattered through it (w.wav shape).
+start = int(0.9 * sr)
+write("quiet", [0] * start + [random.choice((-3, -2, -1, 1, 2, 3)) if random.random() > 0.15 else 0
+                              for _ in range(n - start)])
+# Working bud, speaking: 1 s startup zeros, then a tone gated off every third 100 ms.
+write("speech", [0] * sr + [int(3000 * math.sin(2 * math.pi * 300 * i / sr)) if (i // 4800) % 3 else 0
+                            for i in range(n - sr)])
+# Too short to judge (1 s).
+write("short", [5] * sr)
+PY
+: > "$PROBE_TMP/empty.wav"
+
+# mic_verdict <wav> -> full verdict line from jabra_mic_verdict
+mic_verdict() {
+    STATE_FILE=/dev/null bash -c "source '$DAEMON'; jabra_mic_verdict '$1'" 2>/dev/null
+}
+
+assert_eq "verdict: all zeros -> dead"            "$(mic_verdict "$PROBE_TMP/dead.wav"   | awk '{print $1}')" "dead"
+assert_eq "verdict: zeros + one click -> dead"    "$(mic_verdict "$PROBE_TMP/click.wav"  | awk '{print $1}')" "dead"
+assert_eq "verdict: silent-room noise floor -> ok" "$(mic_verdict "$PROBE_TMP/quiet.wav" | awk '{print $1}')" "ok"
+assert_eq "verdict: gated speech -> ok"           "$(mic_verdict "$PROBE_TMP/speech.wav" | awk '{print $1}')" "ok"
+assert_eq "verdict: empty file -> inconclusive"   "$(mic_verdict "$PROBE_TMP/empty.wav"  | awk '{print $1}')" "inconclusive"
+assert_eq "verdict: 1 s file -> inconclusive"     "$(mic_verdict "$PROBE_TMP/short.wav"  | awk '{print $1}')" "inconclusive"
+assert_eq "verdict: missing file -> inconclusive" "$(mic_verdict "$PROBE_TMP/nope.wav"   | awk '{print $1}')" "inconclusive"
+if mic_verdict "$PROBE_TMP/quiet.wav" | grep -qE '^ok nonzero=[0-9.]+ rms=-?[0-9.inf]+ longest_zero=[0-9.]+ secs=[0-9.]+$'; then
+    test_result "verdict line carries nonzero/rms/longest_zero/secs stats" "pass"
+else
+    test_result "verdict line carries nonzero/rms/longest_zero/secs stats ($(mic_verdict "$PROBE_TMP/quiet.wav"))" "fail"
+fi
+
+# probe_harness <mode> — runs probe_jabra_mic (mode=probe) or do_probe_mic
+# (mode=subcommand) against stubbed pactl / recorder / notify / sleep / log.
+# Inputs (env): SEQ   space-separated recordings returned by successive takes
+#               MUTE  yes|no            SRCVOL  source volume line fragment
+#               SINKVOL_AFTER  raw sink volume after the first reading
+#               NOSRC=1  no Jabra source in PipeWire
+#               FLAG=<id>  an earlier dead alert is outstanding (notification id)
+#               COOLDOWN=1 a dead alert was sent just now
+# Outputs in $PROBE_TMP/run: calls (pactl set-*), notify, log, rec (take count), out (stdout)
+probe_harness() {
+    local run="$PROBE_TMP/run"
+    rm -rf "$run"; mkdir -p "$run/xdg"
+    [[ -n "${FLAG:-}" ]] && echo "$FLAG" > "$run/xdg/audio-switcher-mic-alert"
+    [[ -n "${COOLDOWN:-}" ]] && date +%s > "$run/xdg/audio-switcher-mic-alert-cooldown"
+    STATE_FILE=/dev/null XDG_RUNTIME_DIR="$run/xdg" RUN="$run" WAVS="$PROBE_TMP" MODE="$1" \
+    SEQ="${SEQ:-quiet}" MUTE="${MUTE:-no}" SRCVOL="${SRCVOL:-30802 /  47%}" \
+    SINKVOL_AFTER="${SINKVOL_AFTER:-29484}" NOSRC="${NOSRC:-}" bash -c '
+        source "'"$DAEMON"'"
+        sleep() { :; }
+        log() { echo "$*" >> "$RUN/log"; }
+        notify_user() { echo "$1|$2|${4:-}" >> "$RUN/notify"; }
+        notify_user_tracked() { echo "$1|$2|tracked" >> "$RUN/notify"; echo 777; }
+        record_jabra_mic() {
+            local n takes
+            n=$(cat "$RUN/rec" 2>/dev/null || echo 0); echo $((n + 1)) > "$RUN/rec"
+            read -ra takes <<< "$SEQ"
+            cp "$WAVS/${takes[n]:-dead}.wav" "$3"
+        }
+        pactl() {
+            local n v
+            case "$1" in
+                list) [[ -n "$NOSRC" ]] || printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\n" ;;
+                get-source-mute)   echo "Mute: $MUTE" ;;
+                get-source-volume) echo "Volume: mono: $SRCVOL / -19.69 dB" ;;
+                get-default-sink)  echo "jabra-sink" ;;
+                get-sink-volume)
+                    n=$(cat "$RUN/sv" 2>/dev/null || echo 0); echo $((n + 1)) > "$RUN/sv"
+                    if (( n == 0 )); then v=29484; else v=$SINKVOL_AFTER; fi
+                    echo "Volume: front-left: $v /  45% / -20.81 dB,   front-right: $v /  45% / -20.81 dB" ;;
+                get-sink-mute)     echo "Mute: no" ;;
+                set-*)             echo "$*" >> "$RUN/calls" ;;
+            esac
+            return 0
+        }
+        if [[ "$MODE" == subcommand ]]; then do_probe_mic; else probe_jabra_mic; fi
+    ' > "$run/out" 2>/dev/null
+    touch "$run/calls" "$run/notify" "$run/log" "$run/rec"
+}
+P="$PROBE_TMP/run"
+JSRC="alsa_input.usb-_Jabra_Link_390_X-00.mono-fallback"
+
+SEQ="dead dead" probe_harness probe
+assert_eq "probe: dead,dead -> one critical 'silent' alert" "$(cat "$P/notify")" "critical|Jabra mic is silent|tracked"
+assert_eq "probe: dead,dead -> alert flag holds notification id" "$(cat "$P/xdg/audio-switcher-mic-alert" 2>/dev/null)" "777"
+assert_eq "probe: dead,dead -> retried once (2 takes)" "$(cat "$P/rec")" "2"
+if grep -q '^PROBE: jabra mic dead nonzero=0.0' "$P/log"; then
+    test_result "probe: logs one PROBE line with the verdict stats" "pass"
+else
+    test_result "probe: logs one PROBE line with the verdict stats ($(cat "$P/log"))" "fail"
+fi
+
+SEQ="dead quiet" probe_harness probe
+assert_eq "probe: dead,ok -> no notification" "$(cat "$P/notify")" ""
+assert_eq "probe: dead,ok -> no alert flag" "$([[ -f "$P/xdg/audio-switcher-mic-alert" ]] && echo set)" ""
+
+SEQ="quiet" probe_harness probe
+assert_eq "probe: ok -> single take, no retry" "$(cat "$P/rec")" "1"
+assert_eq "probe: ok -> no notification" "$(cat "$P/notify")" ""
+
+SEQ="quiet" probe_harness probe
+if grep -qx "set-source-volume $JSRC 100%" "$P/calls"; then
+    test_result "probe: forces Jabra mic volume to JABRA_SOURCE_VOLUME (47% -> 100%)" "pass"
+else
+    test_result "probe: forces Jabra mic volume to JABRA_SOURCE_VOLUME ($(cat "$P/calls"))" "fail"
+fi
+SEQ="quiet" SRCVOL="65536 / 100%" probe_harness probe
+assert_eq "probe: mic already at 100% -> no volume change" "$(grep -c 'set-source-volume' "$P/calls")" "0"
+
+SEQ="quiet" MUTE=yes probe_harness probe
+if grep -qx "set-source-mute $JSRC 0" "$P/calls"; then
+    test_result "probe: muted mic is unmuted" "pass"
+else
+    test_result "probe: muted mic is unmuted ($(cat "$P/calls"))" "fail"
+fi
+assert_eq "probe: muted + ok -> one normal 'unmuted' notification" "$(cat "$P/notify")" "normal|Jabra mic unmuted|"
+
+SEQ="dead dead" MUTE=yes probe_harness probe
+assert_eq "probe: muted + dead -> unmuted notice AND silent alert" "$(cat "$P/notify")" \
+    "$(printf 'normal|Jabra mic unmuted|\ncritical|Jabra mic is silent|tracked')"
+
+SEQ="quiet" FLAG=4242 probe_harness probe
+assert_eq "probe: ok after an alert -> 'working again' replaces it" "$(cat "$P/notify")" "normal|Jabra mic working again|4242"
+assert_eq "probe: ok after an alert -> flag cleared" "$([[ -f "$P/xdg/audio-switcher-mic-alert" ]] && echo set)" ""
+
+SEQ="dead dead" COOLDOWN=1 probe_harness probe
+assert_eq "probe: dead within alert cooldown -> no second popup" "$(cat "$P/notify")" ""
+
+NOSRC=1 probe_harness probe
+assert_eq "probe: no Jabra source -> nothing recorded" "$(cat "$P/rec")" ""
+assert_eq "probe: no Jabra source -> no notification" "$(cat "$P/notify")" ""
+
+SEQ="dead dead" SINKVOL_AFTER=20000 probe_harness probe
+assert_eq "probe: sink volume drift is restored to the snapshot" \
+    "$(grep 'set-sink-volume' "$P/calls")" "set-sink-volume jabra-sink 29484 29484"
+SEQ="quiet" probe_harness probe
+assert_eq "probe: unchanged sink volume -> no restore" "$(grep -c 'set-sink' "$P/calls")" "0"
+
+# probe-mic subcommand: report only, never change anything
+SEQ="quiet" MUTE=yes probe_harness subcommand
+assert_eq "probe-mic: muted mic -> reports muted" "$(awk '{print $1}' "$P/out")" "muted"
+assert_eq "probe-mic: muted mic -> no recording" "$(cat "$P/rec")" ""
+SEQ="quiet" probe_harness subcommand
+assert_eq "probe-mic: live mic -> prints verdict" "$(awk '{print $1}' "$P/out")" "ok"
+if grep -q 'vol=47%' "$P/out"; then
+    test_result "probe-mic: verdict line reports the mic volume" "pass"
+else
+    test_result "probe-mic: verdict line reports the mic volume ($(cat "$P/out"))" "fail"
+fi
+assert_eq "probe-mic: changes nothing (no pactl set-*)" "$(cat "$P/calls")" ""
+
+# stop_jabra_probe must end a running probe promptly (not after its current
+# sleep/recording finishes) and the probe's trap must still restore volume.
+probe_stop_run() {
+    local run="$PROBE_TMP/stop"
+    rm -rf "$run"; mkdir -p "$run/xdg"
+    STATE_FILE=/dev/null XDG_RUNTIME_DIR="$run/xdg" RUN="$run" bash -c '
+        source "'"$DAEMON"'"
+        JABRA_PROBE_DELAY=0
+        log() { :; }
+        notify_user() { :; }
+        record_jabra_mic() { command sleep 30; }
+        pactl() {
+            local n v
+            case "$1" in
+                list) printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\n" ;;
+                get-source-mute)   echo "Mute: no" ;;
+                get-source-volume) echo "Volume: mono: 65536 / 100% / 0.00 dB" ;;
+                get-default-sink)  echo "jabra-sink" ;;
+                get-sink-volume)
+                    n=$(cat "$RUN/sv" 2>/dev/null || echo 0); echo $((n + 1)) > "$RUN/sv"
+                    if (( n == 0 )); then v=29484; else v=20000; fi
+                    echo "Volume: front-left: $v /  45% / -20.81 dB,   front-right: $v /  45% / -20.81 dB" ;;
+                get-sink-mute)     echo "Mute: no" ;;
+                set-*)             echo "$*" >> "$RUN/calls" ;;
+            esac
+            return 0
+        }
+        start_jabra_probe
+        command sleep 1
+        t0=$SECONDS
+        stop_jabra_probe
+        wait 2>/dev/null || true
+        echo $(( SECONDS - t0 )) > "$RUN/elapsed"
+    ' 2>/dev/null
+}
+probe_stop_run
+if [[ -f "$PROBE_TMP/stop/elapsed" ]] && (( $(cat "$PROBE_TMP/stop/elapsed") <= 3 )); then
+    test_result "stop_jabra_probe ends a mid-recording probe promptly" "pass"
+else
+    test_result "stop_jabra_probe ends a mid-recording probe promptly (took $(cat "$PROBE_TMP/stop/elapsed" 2>/dev/null || echo '?')s)" "fail"
+fi
+assert_eq "stop_jabra_probe: killed probe still restores sink volume" \
+    "$(grep 'set-sink-volume' "$PROBE_TMP/stop/calls" 2>/dev/null)" "set-sink-volume jabra-sink 29484 29484"
+
+rm -rf "$PROBE_TMP"
 
 echo ""
 

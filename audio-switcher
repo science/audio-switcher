@@ -17,7 +17,7 @@
 # Keeping the default SINK and SOURCE matched to the SAME device is the core
 # job — the OS and apps routinely mismatch headset speaker/mic on their own.
 #
-# Run interactively:  ./audio-switcher [-v|--verbose]
+# Run interactively:  ./audio-switcher [-v|--verbose] | fix | probe-mic
 # Install as service: ./install.sh
 
 set -euo pipefail
@@ -32,6 +32,28 @@ JABRA_VID="0b0e"                    # GN Netcom / Jabra USB vendor id (for hidra
 # prefers by priority but which is SILENT on the buds. Force the analog output
 # plus the mono mic input whenever the buds are the active device.
 JABRA_PROFILE="output:analog-stereo+input:mono-fallback"
+
+# Jabra mic probe. The buds can relink in a state where the mic delivers only
+# exact digital zeros (seen 2026-10-09; a bud case-cycle fixes it, nothing on
+# the host can). On each connect the daemon listens to the mic briefly and
+# raises a desktop alert if it hears pure zeros. A working bud never does:
+# even in a silent room it emits a faint noise floor (~85% non-zero samples);
+# its only block of zeros is ~1 s while it switches into call mode.
+JABRA_SOURCE_VOLUME="100%"      # mic input level forced on every connect
+JABRA_PROBE_DELAY=5             # seconds after connect before probing
+JABRA_PROBE_SKIP=1.5            # seconds of call-mode startup zeros to discard
+JABRA_PROBE_LISTEN=5            # seconds of recording that are judged
+JABRA_PROBE_RETRY_DELAY=10      # confirm "dead" once; >5 s so the dongle has left call mode
+JABRA_PROBE_MIN_NONZERO_PCT=5   # below this share of non-zero samples = dead
+JABRA_PROBE_VOLUME_SETTLE=8     # dongle sends call-exit volume keys ~5 s after mic closes
+JABRA_PROBE_ALERT_COOLDOWN=300  # max one "mic is silent" popup per 5 minutes
+# Optional override: probe this PipeWire source instead of the Jabra mic
+# (testing the alert path against e.g. a null sink's monitor).
+JABRA_PROBE_SOURCE="${JABRA_PROBE_SOURCE:-}"
+JABRA_PROBE_WAV="${XDG_RUNTIME_DIR}/audio-switcher-mic-probe.wav"
+JABRA_ALERT_COOLDOWN_FILE="${XDG_RUNTIME_DIR}/audio-switcher-mic-alert-cooldown"
+JABRA_ALERT_FLAG_FILE="${XDG_RUNTIME_DIR}/audio-switcher-mic-alert"  # holds the alert's notification id
+JABRA_PROBE_PID=""
 
 # HID report parsing — BTD-800: vendor report ID 1, byte 19 = connection flag
 BTD_HID_REPORT_ID=1
@@ -76,8 +98,19 @@ debug() {
 
 # --- Desktop Notifications ---
 notify_user() {
-    local urgency="$1" title="$2" body="$3"
-    notify-send -u "$urgency" -a "audio-switcher" "$title" "$body" 2>/dev/null || true
+    local urgency="$1" title="$2" body="$3" replace_id="${4:-}"
+    local args=(-u "$urgency" -a "audio-switcher")
+    [[ -n "$replace_id" ]] && args+=(-r "$replace_id")
+    notify-send "${args[@]}" "$title" "$body" 2>/dev/null || true
+}
+
+# Like notify_user, but prints the notification id so a later notification can
+# replace it in place (notify_user's 4th argument).
+notify_user_tracked() {
+    local urgency="$1" title="$2" body="$3" replace_id="${4:-}"
+    local args=(-p -u "$urgency" -a "audio-switcher")
+    [[ -n "$replace_id" ]] && args+=(-r "$replace_id")
+    notify-send "${args[@]}" "$title" "$body" 2>/dev/null || true
 }
 
 # --- PipeWire Restart Notification (cooldown-guarded) ---
@@ -515,6 +548,255 @@ finally:
 " 2>&1
 }
 
+# --- Jabra Mic Probe ---
+# jabra_mic_verdict <wav>: judge a probe recording. Discards the first
+# JABRA_PROBE_SKIP seconds (call-mode startup zeros) and measures the rest.
+# Prints "<ok|dead|inconclusive> nonzero=<pct> rms=<dBFS> longest_zero=<s> secs=<s>".
+# inconclusive = unreadable, or under 2 s left to judge; it never alerts.
+jabra_mic_verdict() {
+    python3 - "$1" "$JABRA_PROBE_SKIP" "$JABRA_PROBE_MIN_NONZERO_PCT" <<'PYEOF'
+import array, math, sys, wave
+
+path, skip, min_pct = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+rate, data = 48000, array.array("h")
+try:
+    with wave.open(path, "rb") as w:
+        rate = w.getframerate()
+        if w.getsampwidth() == 2 and w.getnchannels() == 1:
+            data.frombytes(w.readframes(w.getnframes()))
+except (OSError, EOFError, wave.Error):
+    pass
+
+seg = data[int(skip * rate):]
+n = len(seg)
+nonzero = longest = run = 0
+for s in seg:
+    if s:
+        nonzero += 1
+        run = 0
+    else:
+        run += 1
+        if run > longest:
+            longest = run
+rms = math.sqrt(sum(s * s for s in seg) / n) if n else 0.0
+pct = 100.0 * nonzero / n if n else 0.0
+db = f"{20 * math.log10(rms / 32768):.1f}" if rms else "-inf"
+if n < 2 * rate:
+    verdict = "inconclusive"
+elif pct < min_pct:
+    verdict = "dead"
+else:
+    verdict = "ok"
+print(f"{verdict} nonzero={pct:.1f} rms={db} longest_zero={longest / rate:.2f} secs={len(data) / rate:.1f}")
+PYEOF
+}
+
+# record_jabra_mic <source> <secs> <out.wav>: record mono s16 from a PipeWire
+# source. PipeWire shares capture, so apps already using the mic are
+# unaffected. Stopped with SIGINT, not timeout's default SIGTERM, so pw-record
+# finalises the WAV (SIGTERM left a truncated ~0.7 s file in testing).
+record_jabra_mic() {
+    local src="$1" secs="$2" out="$3"
+    rm -f "$out"
+    timeout -s INT "$secs" pw-record --target "$src" --rate 48000 --channels 1 --format s16 "$out" \
+        >/dev/null 2>&1 || true
+}
+
+jabra_probe_source() {
+    if [[ -n "$JABRA_PROBE_SOURCE" ]]; then
+        echo "$JABRA_PROBE_SOURCE"
+    else
+        find_jabra_source
+    fi
+}
+
+# jabra_mic_state <source> -> "muted" or "live"
+jabra_mic_state() {
+    if [[ "$(pactl get-source-mute "$1" 2>/dev/null || true)" == *yes* ]]; then
+        echo muted
+    else
+        echo live
+    fi
+}
+
+# jabra_mic_volume <source> -> first channel's volume, e.g. "47%" ("" if unknown)
+jabra_mic_volume() {
+    local line
+    line=$(pactl get-source-volume "$1" 2>/dev/null || true)
+    if [[ "$line" =~ ([0-9]+%) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# ensure_jabra_mic_live <source>: unmute the mic and force JABRA_SOURCE_VOLUME.
+# A muted or turned-down source delivers zeros too (PipeWire applies mute and
+# volume before any recorder), which would read as a dead bud. Prints the
+# changes made, comma-separated ("unmuted,volume=47%->100%"), or nothing.
+ensure_jabra_mic_live() {
+    local src="$1" vol changes=()
+    if [[ "$(jabra_mic_state "$src")" == muted ]]; then
+        pactl set-source-mute "$src" 0 2>/dev/null || true
+        changes+=(unmuted)
+    fi
+    vol=$(jabra_mic_volume "$src")
+    if [[ -n "$vol" && "$vol" != "$JABRA_SOURCE_VOLUME" ]]; then
+        pactl set-source-volume "$src" "$JABRA_SOURCE_VOLUME" 2>/dev/null || true
+        changes+=("volume=${vol}->${JABRA_SOURCE_VOLUME}")
+    fi
+    local IFS=,
+    echo "${changes[*]:-}"
+}
+
+# probe_jabra_mic_once <source>: record one take and judge it. Sets the global
+# PROBE_RESULT (the verdict line plus "vol=<mic volume>") instead of printing,
+# so the recorder runs as a direct child of the probe and stop_jabra_probe can
+# end it immediately.
+PROBE_RESULT=""
+probe_jabra_mic_once() {
+    local src="$1" secs vol
+    vol=$(jabra_mic_volume "$src")
+    secs=$(awk -v a="$JABRA_PROBE_SKIP" -v b="$JABRA_PROBE_LISTEN" 'BEGIN { print a + b }')
+    record_jabra_mic "$src" "$secs" "$JABRA_PROBE_WAV"
+    PROBE_RESULT="$(jabra_mic_verdict "$JABRA_PROBE_WAV") vol=${vol:-?}"
+    rm -f "$JABRA_PROBE_WAV"
+}
+
+# Volume-drift guard. Opening and closing the mic makes the dongle enter and
+# leave call mode, and it sends volume-key presses as it does (+2/-2 when
+# healthy, -3/-3 when the bud is stuck). Cinnamon applies them to the default
+# sink. The probe snapshots that sink's raw volume and mute and puts them back.
+PROBE_SINK=""
+PROBE_SINK_SNAPSHOT=""
+
+# sink_volume_state <sink> -> "<raw volume per channel>|<yes|no>"
+# (empty volume part when the sink no longer exists)
+sink_volume_state() {
+    local vols mute
+    vols=$(pactl get-sink-volume "$1" 2>/dev/null | grep -oE '[0-9]+ /' | tr -d ' /' | tr '\n' ' ' || true)
+    mute=$(pactl get-sink-mute "$1" 2>/dev/null || true)
+    echo "${vols% }|${mute#Mute: }"
+}
+
+probe_snapshot_sink_volume() {
+    PROBE_SINK=$(pactl get-default-sink 2>/dev/null || true)
+    PROBE_SINK_SNAPSHOT=""
+    if [[ -n "$PROBE_SINK" ]]; then
+        PROBE_SINK_SNAPSHOT=$(sink_volume_state "$PROBE_SINK")
+        if [[ -z "${PROBE_SINK_SNAPSHOT%|*}" ]]; then
+            PROBE_SINK_SNAPSHOT=""
+        fi
+    fi
+}
+
+# Restore the snapshot if the sink still exists and its volume or mute moved.
+# Trade-off: a manual change made during the probe is reverted too.
+probe_restore_sink_volume() {
+    local snap="$PROBE_SINK_SNAPSHOT" now vols mute
+    PROBE_SINK_SNAPSHOT=""
+    [[ -n "$snap" ]] || return 0
+    now=$(sink_volume_state "$PROBE_SINK")
+    if [[ -z "${now%|*}" || "$now" == "$snap" ]]; then
+        return 0
+    fi
+    read -ra vols <<< "${snap%|*}"
+    pactl set-sink-volume "$PROBE_SINK" "${vols[@]}" 2>/dev/null || true
+    if [[ "${snap#*|}" != "${now#*|}" ]]; then
+        if [[ "${snap#*|}" == yes ]]; then mute=1; else mute=0; fi
+        pactl set-sink-mute "$PROBE_SINK" "$mute" 2>/dev/null || true
+    fi
+    log "PROBE: restored $PROBE_SINK volume after dongle volume-key drift (${now%|*} -> ${snap%|*})"
+}
+
+# Critical (stays on screen) "mic is silent" popup, cooldown-guarded. The
+# flag file records that an alert is outstanding and holds its notification
+# id, so the next healthy probe can replace it with "working again".
+notify_jabra_mic_dead() {
+    local now last="" id prev=""
+    now=$(date +%s)
+    [[ -f "$JABRA_ALERT_COOLDOWN_FILE" ]] && last=$(cat "$JABRA_ALERT_COOLDOWN_FILE" 2>/dev/null || true)
+    [[ -f "$JABRA_ALERT_FLAG_FILE" ]] && prev=$(cat "$JABRA_ALERT_FLAG_FILE" 2>/dev/null || true)
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < JABRA_PROBE_ALERT_COOLDOWN )); then
+        debug "suppressing mic-silent notification (cooldown active)"
+        echo "$prev" > "$JABRA_ALERT_FLAG_FILE"
+        return 0
+    fi
+    echo "$now" > "$JABRA_ALERT_COOLDOWN_FILE"
+    id=$(notify_user_tracked critical "Jabra mic is silent" \
+        "The buds connected but the mic is sending no audio. Hold the bud button 4 s to power it off, leave it in the closed case for 3 minutes, then take it out. (A quick case-cycle often does not clear this.)" \
+        "$prev")
+    echo "$id" > "$JABRA_ALERT_FLAG_FILE"
+}
+
+# probe_jabra_mic: runs in the background after a Jabra connect (see
+# start_jabra_probe). Listens to the mic, confirms a "dead" result once, then
+# alerts. Logs exactly one PROBE line per connect.
+probe_jabra_mic() {
+    trap 'probe_restore_sink_volume; rm -f "$JABRA_PROBE_WAV"; exit 0' TERM INT
+    sleep "$JABRA_PROBE_DELAY"
+
+    local src fixed verdict id
+    src=$(jabra_probe_source)
+    if [[ -z "$src" ]]; then
+        log "PROBE: no Jabra mic source in PipeWire; mic check skipped"
+        trap - TERM INT
+        return 0
+    fi
+
+    fixed=$(ensure_jabra_mic_live "$src")
+    if [[ "$fixed" == *unmuted* ]]; then
+        notify_user normal "Jabra mic unmuted" \
+            "The Jabra mic was muted when the buds connected, so audio-switcher unmuted it. You are live."
+    fi
+
+    probe_snapshot_sink_volume
+    probe_jabra_mic_once "$src"
+    if [[ "${PROBE_RESULT%% *}" == dead ]]; then
+        sleep "$JABRA_PROBE_RETRY_DELAY"
+        probe_jabra_mic_once "$src"
+    fi
+    verdict="${PROBE_RESULT%% *}"
+    log "PROBE: jabra mic $PROBE_RESULT fixed=${fixed:-none}"
+
+    case "$verdict" in
+        dead)
+            notify_jabra_mic_dead
+            ;;
+        ok)
+            if [[ -f "$JABRA_ALERT_FLAG_FILE" ]]; then
+                id=$(cat "$JABRA_ALERT_FLAG_FILE" 2>/dev/null || true)
+                rm -f "$JABRA_ALERT_FLAG_FILE" "$JABRA_ALERT_COOLDOWN_FILE"
+                notify_user normal "Jabra mic working again" "The buds' mic is sending audio." "$id"
+            fi
+            ;;
+    esac
+
+    sleep "$JABRA_PROBE_VOLUME_SETTLE"
+    probe_restore_sink_volume
+    trap - TERM INT
+}
+
+# Run one probe in the background (replacing any probe already running), so
+# the HID event loop is never blocked.
+start_jabra_probe() {
+    stop_jabra_probe
+    probe_jabra_mic &
+    JABRA_PROBE_PID=$!
+}
+
+stop_jabra_probe() {
+    local pid="$JABRA_PROBE_PID"
+    JABRA_PROBE_PID=""
+    [[ -n "$pid" ]] || return 0
+    # Only signal our own child: the pid may have been reused since it exited.
+    if [[ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)" == "$$" ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        # bash runs the probe's TERM trap only after its current foreground
+        # command (sleep / recorder) ends, so end that too.
+        pkill -TERM -P "$pid" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # --- Main Event Loop ---
 # Discovers both dongles' hidraw devices and monitors whichever are present
 # concurrently, merging their tagged events. Any subset of dongles may be
@@ -532,9 +814,16 @@ handle_event() {
             # Newly connected devices are prone to broken pipes — enter hunt mode.
             log "HUNT: entering hunt mode after $device connect"
             echo "$(date +%s) hunt" > "$PW_COOLDOWN_FILE"
+            # The Jabra mic can relink delivering pure zeros; check it.
+            if [[ "$device" == jabra ]]; then
+                start_jabra_probe
+            fi
             ;;
         disconnected)
             log "EVENT: $device disconnected"
+            if [[ "$device" == jabra ]]; then
+                stop_jabra_probe
+            fi
             sleep "$SETTLE_DELAY"
             set_device_state "$device" disconnected
             apply_priority
@@ -592,9 +881,29 @@ cleanup() {
     if [[ -n "${SLEEP_PID:-}" ]]; then
         kill "$SLEEP_PID" 2>/dev/null || true
     fi
+    stop_jabra_probe
     jobs -p | xargs -r kill 2>/dev/null || true
-    rm -f "$STATE_FILE" "$PW_COOLDOWN_FILE" "$PW_NOTIFY_COOLDOWN_FILE"
+    rm -f "$STATE_FILE" "$PW_COOLDOWN_FILE" "$PW_NOTIFY_COOLDOWN_FILE" \
+        "$JABRA_ALERT_FLAG_FILE" "$JABRA_ALERT_COOLDOWN_FILE" "$JABRA_PROBE_WAV"
     exit 0
+}
+
+# --- probe-mic Subcommand ---
+# One immediate probe of the Jabra mic, for calibration. Reports only: never
+# unmutes, changes volume, retries or notifies.
+do_probe_mic() {
+    local src
+    src=$(jabra_probe_source)
+    if [[ -z "$src" ]]; then
+        echo "no Jabra mic source in PipeWire (are the buds connected?)"
+        return 1
+    fi
+    if [[ "$(jabra_mic_state "$src")" == muted ]]; then
+        echo "muted vol=$(jabra_mic_volume "$src") (mic is muted; unmute it to probe, nothing recorded)"
+        return 0
+    fi
+    probe_jabra_mic_once "$src"
+    echo "$PROBE_RESULT"
 }
 
 # --- Fix Subcommand ---
@@ -624,9 +933,15 @@ main() {
         case "$1" in
             -v|--verbose) VERBOSE=true; shift ;;
             fix) ACTION="fix"; shift ;;
+            probe-mic) ACTION="probe-mic"; shift ;;
             *) echo "Unknown option: $1"; exit 1 ;;
         esac
     done
+
+    if [[ "$ACTION" == "probe-mic" ]]; then
+        do_probe_mic
+        exit $?
+    fi
 
     trap cleanup SIGTERM SIGINT
 

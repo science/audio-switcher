@@ -7,7 +7,8 @@ A PipeWire auto-routing and recovery daemon for Linux. Two jobs:
 1. **HID-based headset detection + priority routing** — Reads vendor HID reports from each headset dongle's hidraw device to detect connect/disconnect, then routes PipeWire defaults by a priority ladder. Keeping the default **sink and source matched to the same device** is the core job — the OS/apps routinely mismatch headset speaker/mic on their own.
 
    Priority ladder: **Jabra Evolve2 buds (Link 390) > Sennheiser BTD-800 > S/PDIF speakers**. A dongle merely being plugged in does *not* count — the headset must be linked to it. When the active headset disconnects, routing falls through to the next-highest connected device, or to S/PDIF (sink only — no matching mic).
-2. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults based on the current priority resolution.
+2. **Jabra mic probe** — On each Jabra connect, listens to the mic for a few seconds in the background. The buds can relink delivering only exact digital zeros (mic dead, speaker fine; a bud case-cycle fixes it). Pure zeros, confirmed by one retry, raise a critical desktop popup; the next healthy probe replaces it with "working again". The probe also unmutes the mic and forces `JABRA_SOURCE_VOLUME` (a muted or turned-down source delivers zeros too).
+3. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults based on the current priority resolution.
 
 ## Architecture
 
@@ -69,6 +70,22 @@ Background subshells in bash can't share variables. The state file (`$XDG_RUNTIM
 
 Sink/source names are **discovered at runtime** (`find_btd_sink/source`, `find_jabra_sink/source`). The Jabra name carries the dongle serial and can gain a suffix on re-plug (e.g. `…99AB` → `…99AB2`), so matching is by the `JABRA_SINK_MATCH` pattern, never the exact string.
 
+### Jabra Mic Probe
+
+A working bud never delivers pure zeros: even in a silent room it emits a faint noise floor (~85% non-zero samples). Its only block of zeros is ~1 s at stream start while the dongle switches the bud into call mode, so the first `JABRA_PROBE_SKIP` seconds are discarded. A stuck bud measured 0.0–0.4% non-zero. The verdict is the share of non-zero samples, not "any sample non-zero" (rounding blips and switch clicks exist).
+
+Recording uses `pw-record` against the source by name. PipeWire shares capture, so apps already using the mic are unaffected. Opening the mic puts the dongle in call mode, and it sends volume-key presses on entering and leaving it (+2/-2 healthy, -3/-3 stuck) that Cinnamon applies to the default sink; the probe snapshots the sink's raw volume and restores it `JABRA_PROBE_VOLUME_SETTLE` seconds after the last take.
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `JABRA_SOURCE_VOLUME` | `100%` | Mic input level forced on every connect (also makes the quiet-room noise floor measurable) |
+| `JABRA_PROBE_DELAY` | 5 | Seconds after connect before probing |
+| `JABRA_PROBE_SKIP` / `JABRA_PROBE_LISTEN` | 1.5 / 5 | Startup seconds discarded / seconds judged |
+| `JABRA_PROBE_RETRY_DELAY` | 10 | Wait before confirming "dead" (dongle leaves call mode ~5 s after mic close) |
+| `JABRA_PROBE_MIN_NONZERO_PCT` | 5 | Below this share of non-zero samples = dead |
+| `JABRA_PROBE_ALERT_COOLDOWN` | 300 | Max one "mic is silent" popup per 5 minutes |
+| `JABRA_PROBE_SOURCE` | (env, empty) | Probe another source instead (testing, e.g. a null sink's `.monitor`) |
+
 ### PipeWire Recovery Constants
 
 | Constant | Value | Purpose |
@@ -89,7 +106,14 @@ Sink/source names are **discovered at runtime** (`find_btd_sink/source`, `find_j
 | `wait_for_jabra_sink()` | Poll for the Jabra sink after a profile switch re-creates it (used by `apply_priority`) |
 | `monitor_hidraw()` / `monitor_jabra_hidraw()` | Read HID reports via embedded Python, emit connected/disconnected |
 | `event_loop()` | Discover + monitor both dongles concurrently; merge tagged events → `handle_event()` |
-| `handle_event(device, state)` | Update device state, re-resolve priority, apply, hunt-mode on connect |
+| `handle_event(device, state)` | Update device state, re-resolve priority, apply, hunt-mode on connect; start/stop the Jabra mic probe |
+| `jabra_mic_verdict(wav)` | Embedded Python: `ok\|dead\|inconclusive` + nonzero%/rms/longest zero run |
+| `record_jabra_mic(src, secs, out)` | `timeout -s INT pw-record` (SIGINT so the WAV is finalised) |
+| `ensure_jabra_mic_live(src)` | Unmute + force `JABRA_SOURCE_VOLUME`; prints changes made |
+| `probe_jabra_mic_once(src)` | One take + verdict into global `PROBE_RESULT` (no subshell, so the recorder is a direct child) |
+| `probe_jabra_mic()` | Background orchestrator: delay, live-ify, snapshot sink volume, probe, retry on dead, notify, restore volume |
+| `start_jabra_probe()` / `stop_jabra_probe()` | One probe at a time; stop kills the probe AND its current child so its TERM trap (volume restore) runs at once |
+| `do_probe_mic()` | `probe-mic` subcommand: one immediate report-only probe (no unmute/volume change/notify) |
 | `set_device_state()` / `get_device_state()` | Per-device state file IPC (key=value lines) |
 | `resolve_active_device()` | Priority resolver → `jabra\|btd\|none` |
 | `apply_priority()` | Resolve ladder + set matched default sink **and** source for the winner |
@@ -98,7 +122,7 @@ Sink/source names are **discovered at runtime** (`find_btd_sink/source`, `find_j
 | `check_pipewire_health()` | Count broken-pipe errors, restart PipeWire if threshold met, `apply_priority` |
 | `pipewire_health_loop()` | Background loop: sleep 30 (hunt: 10), check health, repeat |
 | `sleep_resume_loop()` | Re-apply defaults + hunt mode on wake from suspend |
-| `cleanup()` | Signal handler: kill background jobs, remove runtime files |
+| `cleanup()` | Signal handler: stop probe, kill background jobs, remove runtime files |
 | `main()` | Arg parse + startup; guarded by `BASH_SOURCE`==`$0` so tests can source the daemon |
 
 ## Development Rules
@@ -171,6 +195,12 @@ Categories:
 ./uninstall.sh
 # or: ./install.sh --uninstall
 ```
+
+### Probe the Jabra mic now (calibration / diagnosis)
+```bash
+./audio-switcher probe-mic        # e.g. "ok nonzero=85.7 rms=-72.0 longest_zero=0.00 secs=6.4 vol=100%"
+```
+Opens the mic for ~7 s (bud enters call mode briefly). Every connect also logs one `PROBE:` line with the same stats.
 
 ### Check logs
 ```bash

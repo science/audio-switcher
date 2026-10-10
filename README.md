@@ -10,6 +10,7 @@ PipeWire auto-routing and recovery daemon for Linux. Routes audio across multipl
 
   A dongle being plugged in does *not* count — the headset must be linked to it. When the active headset disconnects, audio falls through to the next connected device, or to S/PDIF (speakers; no matching mic). Keeping sink+source matched is the point: the OS and apps routinely split a headset's speaker and mic onto different devices.
 - **PipeWire crash recovery** — Monitors journalctl for PipeWire broken-pipe errors. When a threshold is exceeded, restarts PipeWire and re-applies the correct audio defaults based on the current headset state. Enters "hunt mode" after connect and resume events for aggressive monitoring.
+- **Jabra mic check** — The Jabra buds can reconnect with a dead mic: the speaker works, but the mic sends pure digital silence and nobody on your call hears you. On every Jabra connect the daemon listens to the mic for a few seconds (alongside any app already using it) and, if it hears only exact zeros twice in a row, pops a persistent "Jabra mic is silent" notification telling you to case-cycle the bud. The next good connect replaces it with "Jabra mic working again". It also unmutes the Jabra mic and sets its input volume to 100% on connect, since a muted or turned-down mic looks the same as a dead one.
 - **Desktop notifications** — Sends a persistent (critical) desktop notification when PipeWire is restarted, warning that apps like Slack may need restarting. Cooldown-guarded to max one notification per 5 minutes.
 - **Sleep/resume recovery** — Monitors systemd-logind D-Bus signals for system wake events. On resume, re-applies audio defaults and enters hunt mode (PipeWire streams often break when USB devices lose power during suspend).
 
@@ -62,7 +63,11 @@ The daemon runs automatically via systemd. For manual/debug use:
 ```bash
 ./audio-switcher              # normal mode
 ./audio-switcher --verbose    # verbose logging
+./audio-switcher fix          # restart PipeWire now if it is logging broken pipes
+./audio-switcher probe-mic    # check the Jabra mic right now (report only)
 ```
+
+`probe-mic` prints a verdict line such as `ok nonzero=85.7 rms=-72.0 longest_zero=0.00 secs=6.4 vol=100%`. `nonzero` is the share of samples that are not exactly zero after the first 1.5 s: a working bud reads tens of percent even in a silent room, a stuck one reads 0.
 
 ## Logs
 
@@ -111,6 +116,8 @@ Then unplug and replug the dongle.
 ```bash
 systemctl --user status audio-switcher
 ```
+
+**"Jabra mic is silent" notification** — The buds linked without a working mic path. Hold the bud button 4 seconds to power it off, leave it in the closed case for about 3 minutes, then take it out. A quick case-cycle cleared it once but failed twice on 2026-10-09; the full power-off reset worked. Confirm with `./audio-switcher probe-mic` (`ok` with a non-zero percentage well above 5).
 
 **PipeWire keeps crashing** — The daemon will restart PipeWire automatically (up to once per 5 minutes). Check PipeWire logs:
 ```bash
