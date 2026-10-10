@@ -34,8 +34,8 @@ JABRA_VID="0b0e"                    # GN Netcom / Jabra USB vendor id (for hidra
 JABRA_PROFILE="output:analog-stereo+input:mono-fallback"
 
 # Jabra mic probe. The buds can relink in a state where the mic delivers only
-# exact digital zeros (seen 2026-10-09; a bud case-cycle fixes it, nothing on
-# the host can). On each connect the daemon listens to the mic briefly and
+# exact digital zeros (seen 2026-10-09; powering the bud off and leaving it in
+# the case a few minutes clears it, nothing on the host can; JABRA-DEAD-MIC.md). On each connect the daemon listens to the mic briefly and
 # raises a desktop alert if it hears pure zeros. A working bud never does:
 # even in a silent room it emits a faint noise floor (~85% non-zero samples);
 # its only block of zeros is ~1 s while it switches into call mode.
@@ -662,8 +662,8 @@ probe_jabra_mic_once() {
 }
 
 # Volume-drift guard. Opening and closing the mic makes the dongle enter and
-# leave call mode, and it sends volume-key presses as it does (+2/-2 when
-# healthy, -3/-3 when the bud is stuck). Cinnamon applies them to the default
+# leave call mode, and it sends a few volume-key presses as it does (the same
+# pattern whether or not the bud is stuck). Cinnamon applies them to the default
 # sink. The probe snapshots that sink's raw volume and mute and puts them back.
 PROBE_SINK=""
 PROBE_SINK_SNAPSHOT=""

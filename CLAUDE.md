@@ -7,7 +7,7 @@ A PipeWire auto-routing and recovery daemon for Linux. Two jobs:
 1. **HID-based headset detection + priority routing** — Reads vendor HID reports from each headset dongle's hidraw device to detect connect/disconnect, then routes PipeWire defaults by a priority ladder. Keeping the default **sink and source matched to the same device** is the core job — the OS/apps routinely mismatch headset speaker/mic on their own.
 
    Priority ladder: **Jabra Evolve2 buds (Link 390) > Sennheiser BTD-800 > S/PDIF speakers**. A dongle merely being plugged in does *not* count — the headset must be linked to it. When the active headset disconnects, routing falls through to the next-highest connected device, or to S/PDIF (sink only — no matching mic).
-2. **Jabra mic probe** — On each Jabra connect, listens to the mic for a few seconds in the background. The buds can relink delivering only exact digital zeros (mic dead, speaker fine; a bud case-cycle fixes it). Pure zeros, confirmed by one retry, raise a critical desktop popup; the next healthy probe replaces it with "working again". The probe also unmutes the mic and forces `JABRA_SOURCE_VOLUME` (a muted or turned-down source delivers zeros too).
+2. **Jabra mic probe** — On each Jabra connect, listens to the mic for a few seconds in the background. The buds can relink delivering only exact digital zeros (mic dead, speaker fine; a full power-off plus a few minutes in the case clears it, a quick case-cycle often does not; see `JABRA-DEAD-MIC.md`). Pure zeros, confirmed by one retry, raise a critical desktop popup; the next healthy probe replaces it with "working again". The probe also unmutes the mic and forces `JABRA_SOURCE_VOLUME` (a muted or turned-down source delivers zeros too).
 3. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults based on the current priority resolution.
 
 ## Architecture
@@ -74,7 +74,7 @@ Sink/source names are **discovered at runtime** (`find_btd_sink/source`, `find_j
 
 A working bud never delivers pure zeros: even in a silent room it emits a faint noise floor (~85% non-zero samples). Its only block of zeros is ~1 s at stream start while the dongle switches the bud into call mode, so the first `JABRA_PROBE_SKIP` seconds are discarded. A stuck bud measured 0.0–0.4% non-zero. The verdict is the share of non-zero samples, not "any sample non-zero" (rounding blips and switch clicks exist).
 
-Recording uses `pw-record` against the source by name. PipeWire shares capture, so apps already using the mic are unaffected. Opening the mic puts the dongle in call mode, and it sends volume-key presses on entering and leaving it (+2/-2 healthy, -3/-3 stuck) that Cinnamon applies to the default sink; the probe snapshots the sink's raw volume and restores it `JABRA_PROBE_VOLUME_SETTLE` seconds after the last take.
+Recording uses `pw-record` against the source by name. PipeWire shares capture, so apps already using the mic are unaffected. Opening the mic puts the dongle in call mode, and it sends volume-key presses on entering and leaving it (typically 2 presses each way, in both the working and stuck states) that Cinnamon applies to the default sink; the probe snapshots the sink's raw volume and restores it `JABRA_PROBE_VOLUME_SETTLE` seconds after the last take.
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
@@ -148,6 +148,7 @@ Recording uses `pw-record` against the source by name. PipeWire shares capture, 
 | `CLAUDE.md` | This file — project rules for AI |
 | `README.md` | User-facing documentation |
 | `PLAN.md` | Original design document |
+| `JABRA-DEAD-MIC.md` | Investigation log for the Jabra buds connecting with a mic that sends pure zeros: occurrences, ruled-out causes, recovery, HID reference, open leads. Add new occurrences here |
 
 ## Testing Approach
 
