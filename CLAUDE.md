@@ -2,13 +2,14 @@
 
 ## What This Is
 
-A PipeWire auto-routing and recovery daemon for Linux. Two jobs:
+A PipeWire auto-routing and recovery daemon for Linux. Its jobs:
 
 1. **HID-based headset detection + priority routing** — Reads vendor HID reports from each headset dongle's hidraw device to detect connect/disconnect, then routes PipeWire defaults by a priority ladder. Keeping the default **sink and source matched to the same device** is the core job — the OS/apps routinely mismatch headset speaker/mic on their own.
 
    Priority ladder: **Jabra Evolve2 buds (Link 390) > Sennheiser BTD-800 > S/PDIF speakers**. A dongle merely being plugged in does *not* count — the headset must be linked to it. When the active headset disconnects, routing falls through to the next-highest connected device, or to S/PDIF (sink only — no matching mic).
 2. **Jabra mic probe** — On each Jabra connect, listens to the mic for a few seconds in the background. The buds can relink delivering only exact digital zeros (mic dead, speaker fine; a full power-off plus a few minutes in the case clears it, a quick case-cycle often does not; see `JABRA-DEAD-MIC.md`). Pure zeros, confirmed by one retry, raise a critical desktop popup; the next healthy probe replaces it with "working again". The probe also unmutes the mic and forces `JABRA_SOURCE_VOLUME` (a muted or turned-down source delivers zeros too).
-3. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults based on the current priority resolution.
+3. **Jabra typing filter** — The bud mics pick up typing nearly as loud as speech. When the Jabra is active, the daemon loads DeepFilterNet (a speech-enhancement neural net, LADSPA build) as a virtual source fed by the raw mic, and makes that the default source. See "Jabra Typing Filter" below.
+4. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults based on the current priority resolution.
 
 ## Architecture
 
@@ -86,6 +87,25 @@ Recording uses `pw-record` against the source by name. PipeWire shares capture, 
 | `JABRA_PROBE_ALERT_COOLDOWN` | 300 | Max one "mic is silent" popup per 5 minutes |
 | `JABRA_PROBE_SOURCE` | (env, empty) | Probe another source instead (testing, e.g. a null sink's `.monitor`) |
 
+### Jabra Typing Filter
+
+Measured 2026-10-13: typing peaks sat only ~14 dB below speech peaks on the raw bud mic. Teams in a browser passed it straight through; Dialpad removed it. Filtering on the host means every app gets clean audio before its own suppression runs.
+
+How it is wired:
+- `pactl load-module module-ladspa-source` runs inside `pipewire-pulse` and creates the virtual source `jabra_clean_mic` (description "Jabra buds mic (typing filtered)"). Its capture stream reads the raw Jabra mic and is passive, so it only opens the raw mic when something records from the filtered one. Cinnamon's sound-applet level meter records from the default source, so in practice it runs whenever the Jabra is the default (about 1.5% of one core).
+- The name must not contain `JABRA_SINK_MATCH`, or `find_jabra_source` would return it.
+- A profile switch re-creates the raw mic under a new name (`….mono-fallback.3`, `.5`, …). WirePlumber relinked the capture stream to the new raw mic in testing; `ensure_jabra_clean_source` moves it back with `pactl move-source-output` if not. It never reloads a loaded filter, because that would cut off apps recording from it.
+- The filter stays loaded across a buds disconnect (apps keep their stream). It is unloaded only when the raw mic is gone, i.e. the dongle was unplugged: checked in `apply_priority` and when an HID monitor exits. The daemon leaves it loaded on exit; `install.sh --uninstall` unloads it.
+- The dead-mic probe always records the RAW mic. The filter outputs exact zeros for silence, which would read as a dead bud. The probe also unmutes the filtered mic and forces `JABRA_SOURCE_VOLUME` on it, since apps record from it.
+- The plugin is optional at runtime: if the file is missing or the load fails, the Jabra default source is the raw mic.
+- `ensure_jabra_clean_source` prints the source name on stdout for capture, so its log lines go to stderr.
+
+Constants:
+- `JABRA_CLEAN_SOURCE` = `jabra_clean_mic` — node name of the filtered virtual mic.
+- `JABRA_DFN_PLUGIN` = `~/.local/lib/audio-switcher/libdeep_filter_ladspa.so` (env-overridable) — installed by `install.sh` from the pinned DeepFilterNet v0.5.6 release, sha256-checked.
+- `JABRA_DFN_LABEL` = `deep_filter_mono`.
+- `JABRA_DFN_CONTROLS` = `100,-15,35,35,0,0.02` — control ports in order: attenuation limit dB (100 = no limit), min / max-ERB / max-DF processing thresholds dB (plugin defaults), min processing buffer, post-filter beta (0.02 = the `deep-filter --pf` setting, which won the listening test over the default, a stronger post-filter, and 20/30 dB attenuation caps).
+
 ### PipeWire Recovery Constants
 
 | Constant | Value | Purpose |
@@ -113,10 +133,14 @@ Recording uses `pw-record` against the source by name. PipeWire shares capture, 
 | `probe_jabra_mic_once(src)` | One take + verdict into global `PROBE_RESULT` (no subshell, so the recorder is a direct child) |
 | `probe_jabra_mic()` | Background orchestrator: delay, live-ify, snapshot sink volume, probe, retry on dead, notify, restore volume |
 | `start_jabra_probe()` / `stop_jabra_probe()` | One probe at a time; stop kills the probe AND its current child so its TERM trap (volume restore) runs at once |
+| `find_jabra_clean_source()` / `jabra_clean_module_id()` | Typing filter's source name / its `module-ladspa-source` index |
+| `jabra_clean_capture(module)` | `"<source-output> <source-id>"` of the filter's capture stream |
+| `ensure_jabra_clean_source(raw)` | Load the filter on the raw mic or re-attach it; print `jabra_clean_mic` (status 1 = use raw) |
+| `drop_jabra_clean_source()` | Unload the filter (raw mic gone) |
 | `do_probe_mic()` | `probe-mic` subcommand: one immediate report-only probe (no unmute/volume change/notify) |
 | `set_device_state()` / `get_device_state()` | Per-device state file IPC (key=value lines) |
 | `resolve_active_device()` | Priority resolver → `jabra\|btd\|none` |
-| `apply_priority()` | Resolve ladder + set matched default sink **and** source for the winner |
+| `apply_priority()` | Resolve ladder + set matched default sink **and** source for the winner (Jabra source = typing-filtered mic); drop the filter if the raw Jabra mic is gone |
 | `apply_sink_source()` | Set a matched sink+source pair (logs changes only) |
 | `apply_spdif_sink()` | S/PDIF fallback sink with retry (output only) |
 | `check_pipewire_health()` | Count broken-pipe errors, restart PipeWire if threshold met, `apply_priority` |
@@ -129,7 +153,7 @@ Recording uses `pw-record` against the source by name. PipeWire shares capture, 
 
 1. **TDD: Red -> Green -> Refactor** — Write or update tests FIRST, verify they fail, then implement. Every change must include tests.
 2. **Run tests after every change** — `./tests/test-audio-switcher.sh`. Non-negotiable.
-3. **Keep it bash-simple** — Pure bash daemon (with embedded Python for binary HID parsing). No external dependencies beyond `pactl`, `journalctl`, `systemctl`, `python3`, and standard coreutils.
+3. **Keep it bash-simple** — Pure bash daemon (with embedded Python for binary HID parsing). No external dependencies beyond `pactl`, `journalctl`, `systemctl`, `python3`, and standard coreutils. The one exception is the optional DeepFilterNet LADSPA plugin, which `install.sh` downloads (pinned, hash-checked) and the daemon can run without.
 4. **Don't break the event loop** — The HID monitor must handle device disconnects gracefully. No unhandled failures.
 5. **Log sparingly** — Log routing changes, PipeWire restarts, and errors. Don't log every poll cycle.
 
@@ -163,9 +187,9 @@ fi
 
 Categories:
 - **Static checks** — Script exists, executable, shebang, constants, functions (HID + recovery + state + Jabra + priority)
-- **Unit checks** — Source the daemon (guarded `main()`) and call functions directly: `resolve_active_device` truth table (jabra×btd combos), the `monitor_jabra_hidraw` parser (connect/disconnect/lookalike), and the Jabra profile enforcer / sink lookup against a stubbed `pactl` shell function (define `pactl() { … }` after sourcing to fake PipeWire).
-- **Installation checks** — Binary installed, service file exists, enabled, active; both udev rules
-- **Runtime checks** — Default sink/source matches the priority resolution (jabra → btd → S/PDIF)
+- **Unit checks** — Source the daemon (guarded `main()`) and call functions directly: `resolve_active_device` truth table (jabra×btd combos), the `monitor_jabra_hidraw` parser (connect/disconnect/lookalike), the Jabra profile enforcer / sink lookup, and the typing filter (load / re-attach / fall back / unload) against a stubbed `pactl` shell function (define `pactl() { … }` after sourcing to fake PipeWire). Don't stub `log` where a function's stdout is captured as a value — that is how the typing filter's log-on-stdout bug hid.
+- **Installation checks** — Binary installed, service file exists, enabled, active; both udev rules; DeepFilterNet plugin present
+- **Runtime checks** — Default sink/source matches the priority resolution (jabra → btd → S/PDIF; the Jabra source is `jabra_clean_mic` when the plugin is installed)
 
 ### TDD Workflow
 1. Add test to `tests/test-audio-switcher.sh` for the new behavior

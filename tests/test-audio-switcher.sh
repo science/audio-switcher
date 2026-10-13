@@ -334,6 +334,14 @@ else
     test_result "install.sh references 70-jabra.rules" "fail"
 fi
 
+# install.sh fetches the pinned DeepFilterNet LADSPA plugin and checks its hash
+if grep -q 'libdeep_filter_ladspa-0.5.6-x86_64-unknown-linux-gnu.so' "$INSTALL_SCRIPT" 2>/dev/null \
+   && grep -q '2ca3205c2911d389604a826a240e745597d50252b5cab81c8248252b335e2236' "$INSTALL_SCRIPT" 2>/dev/null; then
+    test_result "install.sh installs the pinned DeepFilterNet plugin (sha256-checked)" "pass"
+else
+    test_result "install.sh installs the pinned DeepFilterNet plugin (sha256-checked)" "fail"
+fi
+
 # Jabra udev rule file exists and grants hidraw access for vid 0b0e
 if [[ -f "$PROJECT_DIR/70-jabra.rules" ]] && grep -q '0b0e' "$PROJECT_DIR/70-jabra.rules" 2>/dev/null; then
     test_result "70-jabra.rules exists and matches vid 0b0e" "pass"
@@ -478,6 +486,146 @@ fi
 
 echo ""
 
+# --- Unit: Jabra typing filter (DeepFilterNet virtual mic) ---
+# The buds' mic picks up typing loudly. The daemon loads DeepFilterNet's LADSPA
+# plugin as a virtual source fed by the raw Jabra mic and makes THAT the default
+# source; the dead-mic probe keeps listening to the raw mic.
+echo "--- Unit: Jabra typing filter ---"
+
+for const in JABRA_CLEAN_SOURCE JABRA_DFN_PLUGIN JABRA_DFN_LABEL JABRA_DFN_CONTROLS; do
+    if grep -q "^${const}=" "$DAEMON" 2>/dev/null; then
+        test_result "${const} constant present" "pass"
+    else
+        test_result "${const} constant present" "fail"
+    fi
+done
+# Post-filter on (beta 0.02 = deep-filter --pf), thresholds at plugin defaults.
+if grep -q '^JABRA_DFN_CONTROLS="100,-15,35,35,0,0.02"' "$DAEMON" 2>/dev/null; then
+    test_result "JABRA_DFN_CONTROLS: full attenuation + post-filter 0.02" "pass"
+else
+    test_result "JABRA_DFN_CONTROLS: full attenuation + post-filter 0.02" "fail"
+fi
+
+FILTER_TMP=$(mktemp -d)
+: > "$FILTER_TMP/plugin.so"
+JRAW="alsa_input.usb-_Jabra_Link_390_X-00.mono-fallback"
+
+# filter_harness <command> — runs <command> in the sourced daemon against a
+# stubbed pactl. Inputs (env): LOADED=1 filter module already loaded
+#   SO_SRC  source id the filter's capture stream is attached to (raw = 7)
+#   NORAW=1 no raw Jabra source (dongle unplugged)   NOPLUGIN=1 plugin missing
+#   JSTATE  jabra state in the state file (default disconnected)
+# Outputs in $FILTER_TMP/run: calls (pactl load/unload/move/set-*), out (stdout), rc
+filter_harness() {
+    local run="$FILTER_TMP/run"
+    rm -rf "$run"; mkdir -p "$run"
+    [[ -n "${LOADED:-}" ]] && touch "$run/loaded"
+    printf 'jabra=%s\nbtd=disconnected\n' "${JSTATE:-disconnected}" > "$run/state"
+    local plugin="$FILTER_TMP/plugin.so"
+    [[ -n "${NOPLUGIN:-}" ]] && plugin="$FILTER_TMP/missing.so"
+    STATE_FILE="$run/state" XDG_RUNTIME_DIR="$run" RUN="$run" PLUGIN="$plugin" \
+    SO_SRC="${SO_SRC:-7}" NORAW="${NORAW:-}" CMD="$1" bash -c '
+        source "'"$DAEMON"'"
+        JABRA_DFN_PLUGIN="$PLUGIN"
+        sleep() { :; }
+        # log is NOT stubbed: the clean source name is captured by $(...), so
+        # a log line on stdout would corrupt it.
+        pactl() {
+            case "$1 ${2:-} ${3:-}" in
+                "list sources short")
+                    [[ -f "$RUN/loaded" ]] && printf "9\tjabra_clean_mic\tPipeWire\tfloat32le 1ch 48000Hz\tSUSPENDED\n"
+                    [[ -n "$NORAW" ]] || printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\ts16le 1ch 48000Hz\tRUNNING\n" ;;
+                "list sinks short")
+                    [[ -n "$NORAW" ]] || printf "6\talsa_output.usb-_Jabra_Link_390_X-00.analog-stereo\tPipeWire\n" ;;
+                "list modules short")
+                    [[ -f "$RUN/loaded" ]] && printf "536870913\tmodule-ladspa-source\tsource_name=jabra_clean_mic master=x\t\n" ;;
+                "list source-outputs "*)
+                    [[ -f "$RUN/loaded" ]] && printf "Source Output #50\n\tOwner Module: n/a\n\tSource: 7\n\nSource Output #51\n\tOwner Module: 536870913\n\tSource: %s\n\n" "$SO_SRC" ;;
+                "get-default-sink "*)   echo "other-sink" ;;
+                "get-default-source "*) echo "other-source" ;;
+                "load-module "*)   echo "$*" >> "$RUN/calls"; touch "$RUN/loaded"; echo 536870913 ;;
+                "unload-module "*) echo "$*" >> "$RUN/calls"; rm -f "$RUN/loaded" ;;
+                move-*|set-*)      echo "$*" >> "$RUN/calls" ;;
+            esac
+            return 0
+        }
+        eval "$CMD"
+    ' > "$run/out" 2>/dev/null
+    echo $? > "$run/rc"
+    touch "$run/calls"
+}
+F="$FILTER_TMP/run"
+
+# Not loaded yet -> one module-ladspa-source on the raw mic, mono, our controls.
+filter_harness "ensure_jabra_clean_source $JRAW"
+assert_eq "filter: not loaded -> prints the clean source name" "$(cat "$F/out")" "jabra_clean_mic"
+assert_eq "filter: not loaded -> exactly one load-module" "$(grep -c '^load-module' "$F/calls")" "1"
+load_call=$(grep '^load-module' "$F/calls" || true)
+for want in "module-ladspa-source" "source_name=jabra_clean_mic" "master=$JRAW" \
+            "label=deep_filter_mono" "control=100,-15,35,35,0,0.02" "channels=1" \
+            "plugin=$FILTER_TMP/plugin.so" \
+            "source_properties=\"device.description='Jabra buds mic (typing filtered)'\""; do
+    if [[ "$load_call" == *"$want"* ]]; then
+        test_result "filter: load-module carries $want" "pass"
+    else
+        test_result "filter: load-module carries $want (got: $load_call)" "fail"
+    fi
+done
+
+# Plugin not installed -> no load, non-zero status (caller falls back to raw).
+NOPLUGIN=1 filter_harness "ensure_jabra_clean_source $JRAW"
+assert_eq "filter: plugin missing -> no pactl calls" "$(cat "$F/calls")" ""
+assert_eq "filter: plugin missing -> non-zero status, no name" "$(cat "$F/rc")|$(cat "$F/out")" "1|"
+
+# Already loaded and fed by the raw mic -> nothing to do.
+LOADED=1 SO_SRC=7 filter_harness "ensure_jabra_clean_source $JRAW"
+assert_eq "filter: loaded + attached to raw mic -> no calls" "$(cat "$F/calls")" ""
+assert_eq "filter: loaded -> prints the clean source name" "$(cat "$F/out")" "jabra_clean_mic"
+
+# Loaded but its capture stream drifted to another source (a profile switch
+# re-creates the raw mic under a new name) -> move it back, don't reload.
+LOADED=1 SO_SRC=12 filter_harness "ensure_jabra_clean_source $JRAW"
+assert_eq "filter: capture stream on wrong source -> moved back to raw mic" \
+    "$(cat "$F/calls")" "move-source-output 51 $JRAW"
+
+# The raw-mic lookup must never return the virtual source.
+LOADED=1 filter_harness "find_jabra_source"
+assert_eq "find_jabra_source ignores the filtered source" "$(cat "$F/out")" "$JRAW"
+
+# Routing: Jabra active -> default source is the filtered mic.
+JSTATE=connected filter_harness "apply_priority"
+if grep -qx "set-default-source jabra_clean_mic" "$F/calls"; then
+    test_result "apply_priority (jabra): default source = filtered mic" "pass"
+else
+    test_result "apply_priority (jabra): default source = filtered mic ($(tr '\n' ';' < "$F/calls"))" "fail"
+fi
+JSTATE=connected NOPLUGIN=1 filter_harness "apply_priority"
+if grep -qx "set-default-source $JRAW" "$F/calls"; then
+    test_result "apply_priority (jabra, no plugin): default source = raw mic" "pass"
+else
+    test_result "apply_priority (jabra, no plugin): default source = raw mic ($(tr '\n' ';' < "$F/calls"))" "fail"
+fi
+
+# Dongle unplugged -> drop the orphaned filter; dongle still present -> keep it
+# (apps recording from it keep their stream across a buds disconnect).
+LOADED=1 NORAW=1 filter_harness "apply_priority"
+assert_eq "apply_priority (none, dongle gone): filter unloaded" \
+    "$(grep '^unload-module' "$F/calls")" "unload-module 536870913"
+LOADED=1 filter_harness "apply_priority"
+assert_eq "apply_priority (none, dongle present): filter kept" "$(grep -c '^unload-module' "$F/calls")" "0"
+
+# Unplugging the dongle sends no HID event (the monitor just exits), so the
+# event loop must drop the orphaned filter itself.
+if sed -n '/^event_loop()/,/^}/p' "$DAEMON" 2>/dev/null | sed -n '/monitor(s) exited/,$p' | grep -q 'drop_jabra_clean_source'; then
+    test_result "event_loop drops the filter when a dongle's monitor exits and its mic is gone" "pass"
+else
+    test_result "event_loop drops the filter when a dongle's monitor exits and its mic is gone" "fail"
+fi
+
+rm -rf "$FILTER_TMP"
+
+echo ""
+
 # --- Unit: Jabra mic probe ---
 echo "--- Unit: Jabra mic probe ---"
 
@@ -547,7 +695,7 @@ probe_harness() {
     [[ -n "${COOLDOWN:-}" ]] && date +%s > "$run/xdg/audio-switcher-mic-alert-cooldown"
     STATE_FILE=/dev/null XDG_RUNTIME_DIR="$run/xdg" RUN="$run" WAVS="$PROBE_TMP" MODE="$1" \
     SEQ="${SEQ:-quiet}" MUTE="${MUTE:-no}" SRCVOL="${SRCVOL:-30802 /  47%}" \
-    SINKVOL_AFTER="${SINKVOL_AFTER:-29484}" NOSRC="${NOSRC:-}" bash -c '
+    SINKVOL_AFTER="${SINKVOL_AFTER:-29484}" NOSRC="${NOSRC:-}" CLEAN="${CLEAN:-}" bash -c '
         source "'"$DAEMON"'"
         sleep() { :; }
         log() { echo "$*" >> "$RUN/log"; }
@@ -556,13 +704,15 @@ probe_harness() {
         record_jabra_mic() {
             local n takes
             n=$(cat "$RUN/rec" 2>/dev/null || echo 0); echo $((n + 1)) > "$RUN/rec"
+            echo "$1" >> "$RUN/recsrc"
             read -ra takes <<< "$SEQ"
             cp "$WAVS/${takes[n]:-dead}.wav" "$3"
         }
         pactl() {
             local n v
             case "$1" in
-                list) [[ -n "$NOSRC" ]] || printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\n" ;;
+                list) [[ -n "$CLEAN" ]] && printf "9\tjabra_clean_mic\tPipeWire\n"
+                      [[ -n "$NOSRC" ]] || printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\n" ;;
                 get-source-mute)   echo "Mute: $MUTE" ;;
                 get-source-volume) echo "Volume: mono: $SRCVOL / -19.69 dB" ;;
                 get-default-sink)  echo "jabra-sink" ;;
@@ -616,6 +766,18 @@ else
     test_result "probe: muted mic is unmuted ($(cat "$P/calls"))" "fail"
 fi
 assert_eq "probe: muted + ok -> one normal 'unmuted' notification" "$(cat "$P/notify")" "normal|Jabra mic unmuted|"
+
+# With the typing filter loaded, the probe still listens to the RAW mic (the
+# filter turns silence into exact zeros, which would read as a dead bud), but
+# a muted filtered mic is unmuted too: apps record from it.
+SEQ="quiet" MUTE=yes CLEAN=1 probe_harness probe
+assert_eq "probe: filter loaded -> still records the raw Jabra mic" "$(sort -u "$P/recsrc")" "$JSRC"
+if grep -qx "set-source-mute jabra_clean_mic 0" "$P/calls" && grep -qx "set-source-mute $JSRC 0" "$P/calls"; then
+    test_result "probe: filter loaded + muted -> raw AND filtered mic unmuted" "pass"
+else
+    test_result "probe: filter loaded + muted -> raw AND filtered mic unmuted ($(tr '\n' ';' < "$P/calls"))" "fail"
+fi
+assert_eq "probe: filter loaded + muted -> one 'unmuted' notification" "$(cat "$P/notify")" "normal|Jabra mic unmuted|"
 
 SEQ="dead dead" MUTE=yes probe_harness probe
 assert_eq "probe: muted + dead -> unmuted notice AND silent alert" "$(cat "$P/notify")" \
@@ -733,6 +895,14 @@ else
     test_result "audio-switcher service is active" "fail"
 fi
 
+# Typing-filter plugin installed where the daemon looks for it
+DFN_PLUGIN="$HOME/.local/lib/audio-switcher/libdeep_filter_ladspa.so"
+if [[ -f "$DFN_PLUGIN" ]]; then
+    test_result "DeepFilterNet plugin installed (typing filter)" "pass"
+else
+    test_result "DeepFilterNet plugin installed (typing filter, missing: $DFN_PLUGIN)" "fail"
+fi
+
 echo ""
 
 # --- Runtime Checks (priority model) ---
@@ -770,7 +940,12 @@ current_source=$(pactl get-default-source 2>/dev/null || true)
 case "$active" in
     jabra)
         J_SINK=$(pactl list sinks short 2>/dev/null | grep "$JABRA_MATCH" | awk '{print $2}' | head -1)
-        J_SRC=$(pactl list sources short 2>/dev/null | grep "$JABRA_MATCH" | grep -v '\.monitor' | awk '{print $2}' | head -1)
+        # Apps get the typing-filtered virtual mic when the plugin is installed.
+        if [[ -f "$DFN_PLUGIN" ]]; then
+            J_SRC=$(pactl list sources short 2>/dev/null | awk '$2 == "jabra_clean_mic" {print $2}')
+        else
+            J_SRC=$(pactl list sources short 2>/dev/null | grep "$JABRA_MATCH" | grep -v '\.monitor' | awk '{print $2}' | head -1)
+        fi
         if [[ -n "$J_SINK" && "$current_sink" == "$J_SINK" ]]; then
             test_result "default sink is Jabra (buds connected)" "pass"
         else

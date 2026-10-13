@@ -55,6 +55,23 @@ JABRA_ALERT_COOLDOWN_FILE="${XDG_RUNTIME_DIR}/audio-switcher-mic-alert-cooldown"
 JABRA_ALERT_FLAG_FILE="${XDG_RUNTIME_DIR}/audio-switcher-mic-alert"  # holds the alert's notification id
 JABRA_PROBE_PID=""
 
+# Jabra typing filter. The bud mics pick up keyboard clicks almost as loud as
+# speech (typing peaks ~14 dB under voice, measured 2026-10-13) and browser
+# Teams does no suppression. DeepFilterNet (a speech-enhancement neural net,
+# LADSPA build) runs as a virtual source fed by the raw mic, and apps get that
+# as the default source. The dead-mic probe keeps listening to the raw mic:
+# the filter turns silence into exact zeros, which would read as a dead bud.
+# The source name must not contain JABRA_SINK_MATCH, or find_jabra_source
+# would return it.
+JABRA_CLEAN_SOURCE="jabra_clean_mic"
+JABRA_CLEAN_DESCRIPTION="Jabra buds mic (typing filtered)"
+JABRA_DFN_PLUGIN="${JABRA_DFN_PLUGIN:-$HOME/.local/lib/audio-switcher/libdeep_filter_ladspa.so}"
+JABRA_DFN_LABEL="deep_filter_mono"
+# Control ports in order: attenuation limit dB (100 = unlimited), min / max ERB /
+# max DF processing thresholds dB (plugin defaults), min processing buffer, and
+# post-filter beta (0.02 = deep-filter --pf; won the 2026-10-13 listening test).
+JABRA_DFN_CONTROLS="100,-15,35,35,0,0.02"
+
 # HID report parsing — BTD-800: vendor report ID 1, byte 19 = connection flag
 BTD_HID_REPORT_ID=1
 BTD_HID_CONNECT_BYTE=19  # 0-indexed within full report (including report ID byte)
@@ -212,6 +229,85 @@ find_jabra_source() {
 
 find_jabra_card() {
     pactl list cards short 2>/dev/null | grep "$JABRA_SINK_MATCH" | awk '{print $2}' | head -1 || true
+}
+
+# --- Jabra Typing Filter ---
+find_jabra_clean_source() {
+    pactl list sources short 2>/dev/null | awk -v n="$JABRA_CLEAN_SOURCE" '$2 == n {print $2; exit}' || true
+}
+
+# Index of the module-ladspa-source that provides JABRA_CLEAN_SOURCE ("" if none).
+jabra_clean_module_id() {
+    pactl list modules short 2>/dev/null \
+        | awk -v arg="source_name=$JABRA_CLEAN_SOURCE" '$2 == "module-ladspa-source" && index($0, arg) {print $1; exit}' || true
+}
+
+# Index of the source the filter's capture stream currently reads from, and
+# the capture stream's own index: "<source-output> <source>" ("" if none).
+jabra_clean_capture() {
+    local module="$1"
+    pactl list source-outputs 2>/dev/null | awk -v m="$module" '
+        /^Source Output #/ { so = substr($3, 2); owner = ""; next }
+        /^[ \t]*Owner Module:/ { owner = $3; next }
+        /^[ \t]*Source:/ { if (owner == m) { print so, $2; exit } }' || true
+}
+
+# ensure_jabra_clean_source <raw-source>: make sure the filtered virtual mic
+# exists and reads from <raw-source>; print its name. Returns 1 (prints
+# nothing) when the plugin is not installed or the load fails, so the caller
+# falls back to the raw mic. A capture stream left on another source (a
+# profile switch re-creates the raw mic under a new name) is moved back rather
+# than reloaded, so apps recording from the filtered mic keep their stream.
+# Logs go to stderr: callers capture stdout as the source name.
+ensure_jabra_clean_source() {
+    local raw="$1" module capture raw_id attempts=0
+    if [[ ! -f "$JABRA_DFN_PLUGIN" ]]; then
+        debug "typing filter plugin not installed ($JABRA_DFN_PLUGIN); using raw mic" >&2
+        return 1
+    fi
+
+    module=$(jabra_clean_module_id)
+    if [[ -z "$module" ]]; then
+        if ! pactl load-module module-ladspa-source \
+                "source_name=$JABRA_CLEAN_SOURCE" "master=$raw" \
+                "plugin=$JABRA_DFN_PLUGIN" "label=$JABRA_DFN_LABEL" \
+                "control=$JABRA_DFN_CONTROLS" "channels=1" \
+                "source_properties=\"device.description='$JABRA_CLEAN_DESCRIPTION'\"" \
+                >/dev/null 2>&1; then
+            log "ERROR: failed to load the typing filter; using raw Jabra mic" >&2
+            return 1
+        fi
+        while [[ -z "$(find_jabra_clean_source)" ]] && (( attempts < 10 )); do
+            attempts=$((attempts + 1))
+            sleep 0.2
+        done
+        if [[ -z "$(find_jabra_clean_source)" ]]; then
+            log "ERROR: typing filter loaded but its source never appeared; using raw Jabra mic" >&2
+            return 1
+        fi
+        log "FILTER: typing filter loaded on $raw" >&2
+    else
+        capture=$(jabra_clean_capture "$module")
+        raw_id=$(pactl list sources short 2>/dev/null | awk -v n="$raw" '$2 == n {print $1; exit}' || true)
+        if [[ -n "$capture" && -n "$raw_id" && "${capture#* }" != "$raw_id" ]]; then
+            if pactl move-source-output "${capture%% *}" "$raw" 2>/dev/null; then
+                log "FILTER: typing filter re-attached to $raw" >&2
+            else
+                log "WARNING: failed to re-attach typing filter to $raw" >&2
+            fi
+        fi
+    fi
+    echo "$JABRA_CLEAN_SOURCE"
+}
+
+# Unload the filter once its raw mic is gone (dongle unplugged): left loaded,
+# its capture stream would be relinked to some other mic.
+drop_jabra_clean_source() {
+    local module
+    module=$(jabra_clean_module_id)
+    [[ -n "$module" ]] || return 0
+    pactl unload-module "$module" 2>/dev/null || true
+    log "FILTER: typing filter unloaded (Jabra mic gone)"
 }
 
 # --- Card Profile Management ---
@@ -372,9 +468,14 @@ apply_priority() {
     case "$active" in
         jabra)
             ensure_jabra_input_profile
-            local jabra_sink
+            local jabra_sink jabra_source clean
             jabra_sink=$(wait_for_jabra_sink || true)
-            apply_sink_source "Jabra buds" "$jabra_sink" "$(find_jabra_source)" \
+            jabra_source=$(find_jabra_source)
+            # Apps get the typing-filtered mic; the raw mic if the filter is unavailable.
+            if [[ -n "$jabra_source" ]] && clean=$(ensure_jabra_clean_source "$jabra_source"); then
+                jabra_source="$clean"
+            fi
+            apply_sink_source "Jabra buds" "$jabra_sink" "$jabra_source" \
                 "$current_sink" "$current_source"
             ;;
         btd)
@@ -386,6 +487,11 @@ apply_priority() {
             apply_spdif_sink "$current_sink"
             ;;
     esac
+    # The filter stays loaded across a buds disconnect (apps keep their
+    # stream); it goes only when the dongle, and with it the raw mic, is gone.
+    if [[ "$active" != jabra && -z "$(find_jabra_source)" ]]; then
+        drop_jabra_clean_source
+    fi
 }
 
 show_status() {
@@ -743,6 +849,13 @@ probe_jabra_mic() {
     fi
 
     fixed=$(ensure_jabra_mic_live "$src")
+    # Apps record from the typing-filtered mic, so it must be live too.
+    local clean clean_fixed
+    clean=$(find_jabra_clean_source)
+    if [[ -n "$clean" ]]; then
+        clean_fixed=$(ensure_jabra_mic_live "$clean")
+        [[ -n "$clean_fixed" ]] && fixed="${fixed:+$fixed,}filtered:${clean_fixed}"
+    fi
     if [[ "$fixed" == *unmuted* ]]; then
         notify_user normal "Jabra mic unmuted" \
             "The Jabra mic was muted when the buds connected, so audio-switcher unmuted it. You are live."
@@ -867,6 +980,9 @@ event_loop() {
         # Monitor(s) exited — a dongle was likely unplugged. Re-discover.
         log "HID monitor(s) exited, waiting 2s before re-discovering..."
         sleep 2
+        if [[ -z "$(find_jabra_source)" ]]; then
+            drop_jabra_clean_source
+        fi
     done
 }
 
