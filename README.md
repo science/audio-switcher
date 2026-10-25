@@ -14,6 +14,7 @@ PipeWire auto-routing and recovery daemon for Linux. Routes audio across multipl
 - **Jabra typing filter** — The buds' mics pick up keyboard clicks almost as loud as your voice, and some meeting apps (Teams in a browser) do nothing about it. When the Jabra is active the daemon routes your mic through [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet), a speech-enhancement neural network that keeps speech and removes everything else, and makes that filtered mic ("Jabra buds mic (typing filtered)", node `jabra_clean_mic`) the default. Every app gets clean audio before its own noise suppression runs. In a recorded test, typing between words dropped by about 50 dB while speech was unchanged. It costs about 1.5% of one CPU core. The mic check above still listens to the raw mic, because the filter turns silence into exact zeros. If the plugin is missing, the daemon falls back to the raw mic.
 - **Desktop notifications** — Sends a persistent (critical) desktop notification when PipeWire is restarted, warning that apps like Slack may need restarting. Cooldown-guarded to max one notification per 5 minutes.
 - **Sleep/resume recovery** — Monitors systemd-logind D-Bus signals for system wake events. On resume, re-applies audio defaults and enters hunt mode (PipeWire streams often break when USB devices lose power during suspend).
+- **Volume-key resync** — Cinnamon's volume keys keep their own copy of which output is the default, updated only when PipeWire announces a change. During some screen locks every sound card disappears; at unlock they all return at once, and PipeWire can settle on the right default without announcing it. The volume keys then move the Jabra while the speakers play. The daemon watches for the default output being re-created (same name, new index) and, 2 seconds later, switches the default to a throwaway silent output and straight back. That produces the announcement, and a split second of silence.
 
 ## Why HID?
 
@@ -94,6 +95,7 @@ Example output:
 10:45:01: PW-RECOVERY: 7 broken-pipe errors in last 30s, restarting PipeWire
 10:45:03: PW-RECOVERY: defaults re-applied (active=jabra)
 11:20:00: RESUME: system woke from sleep, re-applying defaults
+12:05:33: RESYNC: default sink alsa_output.pci-0000_00_1f.3.iec958-stereo was re-created; re-announced it so volume keys follow it
 ```
 
 ## Diagnostics
@@ -123,6 +125,13 @@ systemctl --user status audio-switcher
 **"Jabra mic is silent" notification** — The buds linked without a working mic path. Hold the bud button 4 seconds to power it off, leave it in the closed case for about 3 minutes, then take it out. A quick case-cycle cleared it once but failed twice on 2026-10-09; the full power-off reset worked. Confirm with `./audio-switcher probe-mic` (`ok` with a non-zero percentage well above 5).
 
 **People still hear typing on the Jabra** — Check that the app is using "Jabra buds mic (typing filtered)", not the raw "Jabra Link 390" mic: `pactl get-default-source` should print `jabra_clean_mic`, and an app that picked a specific mic instead of "default" needs changing in its own settings. If the filter is missing, check that `~/.local/lib/audio-switcher/libdeep_filter_ladspa.so` exists (re-run `./install.sh`) and look for `FILTER:` lines in the log.
+
+**Volume keys show the change but the wrong output moves** — Cinnamon's copy of the default output is stale. The daemon fixes the known cause (an unlock re-creating every sound card; look for a `RESYNC:` line). To see which output the keys move, without changing anything overall (it pops the volume display twice):
+```bash
+D="gdbus call --session --dest org.cinnamon.SettingsDaemon.KeybindingHandler --object-path /org/cinnamon/SettingsDaemon/KeybindingHandler --method org.cinnamon.SettingsDaemon.KeybindingHandler.HandleKeybinding"
+pactl list sinks | grep -E '^\s*(Name|Volume):'; $D 5; pactl list sinks | grep -E '^\s*(Name|Volume):'; $D 3
+```
+Any change of the default output's name re-syncs it, e.g. pick another output in the sound applet and pick the speakers again.
 
 **PipeWire keeps crashing** — The daemon will restart PipeWire automatically (up to once per 5 minutes). Check PipeWire logs:
 ```bash

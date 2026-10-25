@@ -626,6 +626,175 @@ rm -rf "$FILTER_TMP"
 
 echo ""
 
+# --- Unit: desktop default-sink resync ---
+# Cinnamon's volume keys follow libcvc's cached default sink, which updates only
+# on pipewire-pulse change events. When every card is re-created at once (some
+# screen locks/unlocks), pulse can switch the default without an event, so the
+# daemon re-announces a re-created default sink by switching to a throwaway
+# null sink and straight back.
+echo "--- Unit: desktop default-sink resync ---"
+
+for const in DESKTOP_RESYNC_SINK DESKTOP_SYNC_SETTLE; do
+    if grep -q "^${const}=" "$DAEMON" 2>/dev/null; then
+        test_result "${const} constant present" "pass"
+    else
+        test_result "${const} constant present" "fail"
+    fi
+done
+
+SYNC_TMP=$(mktemp -d)
+SPDIF="alsa_output.pci-0000_00_1f.3.iec958-stereo"
+JSINK="alsa_output.usb-_Jabra_Link_390_X-00.analog-stereo"
+
+# sync_harness <command> — runs <command> in the sourced daemon against a
+# stubbed pactl. State lives in files the command may rewrite between calls:
+#   $RUN/default  server default sink name
+#   $RUN/sinks    "<index>\t<name>" lines (pactl list sinks short)
+# Inputs (env): DEF default sink name; SINKS printf-ready sinks list;
+#   STEAL=1 another writer moves the default to the Jabra while the resync
+#   sink is the default (a routing switch racing the resync).
+# Outputs in $SYNC_TMP/run: calls (pactl load/unload/set-*), out (stdout)
+sync_harness() {
+    local run="$SYNC_TMP/run"
+    rm -rf "$run"; mkdir -p "$run"
+    printf '%s\n' "${DEF:-$SPDIF}" > "$run/default"
+    printf "${SINKS:-25\t$SPDIF\n6\t$JSINK\n}" > "$run/sinks"
+    XDG_RUNTIME_DIR="$run" RUN="$run" STEAL="${STEAL:-}" JSINK="$JSINK" CMD="$1" bash -c '
+        source "'"$DAEMON"'"
+        sleep() { :; }
+        pactl() {
+            case "$1 ${2:-} ${3:-}" in
+                "list sinks short") cat "$RUN/sinks" ;;
+                "get-default-sink  ") cat "$RUN/default" ;;
+                "load-module "*)   echo "$*" >> "$RUN/calls"; echo 536870999 ;;
+                "unload-module "*) echo "$*" >> "$RUN/calls" ;;
+                "set-default-sink "*)
+                    echo "$*" >> "$RUN/calls"
+                    if [[ -n "$STEAL" ]]; then echo "$JSINK" > "$RUN/default"
+                    else echo "$2" > "$RUN/default"; fi ;;
+            esac
+            return 0
+        }
+        eval "$CMD"
+    ' > "$run/out" 2>/dev/null
+    touch "$run/calls"
+}
+S="$SYNC_TMP/run"
+RESYNC_CALLS="load-module module-null-sink sink_name=audio_switcher_resync sink_properties=device.description=audio-switcher-resync
+set-default-sink audio_switcher_resync
+set-default-sink $SPDIF
+unload-module 536870999"
+
+sync_harness 'default_sink_identity'
+assert_eq "default_sink_identity: '<name> <index>' of the default sink" "$(cat "$S/out")" "$SPDIF 25"
+DEF="gone-sink" sync_harness 'default_sink_identity'
+assert_eq "default_sink_identity: default sink not listed -> empty" "$(cat "$S/out")" ""
+
+# First look only records the default sink.
+sync_harness 'sync_desktop_default_sink; echo "$LAST_DEFAULT_SINK"'
+assert_eq "resync: first check records the default, no calls" \
+    "$(cat "$S/out")|$(cat "$S/calls")" "$SPDIF 25|"
+
+# Same sink, same index -> nothing (e.g. only the HDMI sink was re-created).
+sync_harness 'LAST_DEFAULT_SINK="'"$SPDIF"' 25"; sync_desktop_default_sink'
+assert_eq "resync: default sink unchanged -> no calls" "$(cat "$S/calls")" ""
+
+# Same sink name, new index -> it was re-created: switch away and back.
+SINKS="381\t$SPDIF\n383\t$JSINK\n" sync_harness \
+    'LAST_DEFAULT_SINK="'"$SPDIF"' 25"; sync_desktop_default_sink; echo "$LAST_DEFAULT_SINK"'
+assert_eq "resync: default sink re-created -> null sink, back, unload" "$(cat "$S/calls")" "$RESYNC_CALLS"
+assert_eq "resync: re-created -> default restored" "$(cat "$S/default")" "$SPDIF"
+assert_eq "resync: re-created -> new index recorded" "$(tail -1 "$S/out")" "$SPDIF 381"
+
+# The daemon switched the default to another sink -> a real change event
+# already went out; just record it.
+sync_harness 'LAST_DEFAULT_SINK="'"$JSINK"' 6"; sync_desktop_default_sink; echo "$LAST_DEFAULT_SINK"'
+assert_eq "resync: default name changed -> no calls, new default recorded" \
+    "$(cat "$S/calls")|$(cat "$S/out")" "|$SPDIF 25"
+
+# During the lock every card is gone and the default is auto_null: keep the
+# last real sink, so the unlock is still seen as a re-creation.
+DEF="auto_null" SINKS="378\tauto_null\n" sync_harness \
+    'LAST_DEFAULT_SINK="'"$SPDIF"' 25"; sync_desktop_default_sink; echo "$LAST_DEFAULT_SINK"'
+assert_eq "resync: auto_null default ignored, last real sink kept" \
+    "$(cat "$S/calls")|$(cat "$S/out")" "|$SPDIF 25"
+
+# Full lock/unlock sequence: cards vanish, then return with new indexes.
+DEF="auto_null" SINKS="378\tauto_null\n" sync_harness '
+    LAST_DEFAULT_SINK="'"$SPDIF"' 25"
+    sync_desktop_default_sink
+    echo "'"$SPDIF"'" > "$RUN/default"
+    printf "381\t'"$SPDIF"'\n383\t'"$JSINK"'\n" > "$RUN/sinks"
+    sync_desktop_default_sink'
+assert_eq "resync: lock (auto_null) then unlock (new index) -> one resync" "$(cat "$S/calls")" "$RESYNC_CALLS"
+
+# Default sink not listed (mid-enumeration) -> nothing, keep the last one.
+DEF="gone-sink" sync_harness \
+    'LAST_DEFAULT_SINK="'"$SPDIF"' 25"; sync_desktop_default_sink; echo "$LAST_DEFAULT_SINK"'
+assert_eq "resync: default sink not listed -> no calls, last kept" \
+    "$(cat "$S/calls")|$(cat "$S/out")" "|$SPDIF 25"
+
+# The resync sink itself showing up as default (never record it).
+DEF="audio_switcher_resync" SINKS="417\taudio_switcher_resync\n25\t$SPDIF\n" sync_harness \
+    'LAST_DEFAULT_SINK="'"$SPDIF"' 25"; sync_desktop_default_sink; echo "$LAST_DEFAULT_SINK"'
+assert_eq "resync: resync sink as default ignored" "$(cat "$S/calls")|$(cat "$S/out")" "|$SPDIF 25"
+
+# A routing switch lands while the resync sink is the default -> don't
+# overwrite it with the old sink; still unload the null sink.
+STEAL=1 sync_harness "resync_desktop_default_sink $SPDIF"
+assert_eq "resync: default changed by someone else mid-resync -> not restored" \
+    "$(grep -c "^set-default-sink $SPDIF" "$S/calls")|$(grep -c '^unload-module 536870999' "$S/calls")" "0|1"
+assert_eq "resync: default changed mid-resync -> the other writer's sink stays" "$(cat "$S/default")" "$JSINK"
+
+# Log lines go to stdout (the journal), not into a captured value.
+SINKS="381\t$SPDIF\n" sync_harness \
+    'LAST_DEFAULT_SINK="'"$SPDIF"' 25"; sync_desktop_default_sink'
+if grep -q "RESYNC:" "$S/out"; then
+    test_result "resync: logs a RESYNC line" "pass"
+else
+    test_result "resync: logs a RESYNC line" "fail"
+fi
+
+# desktop_sync_watch: one check per burst of new-sink events, after the burst
+# has been quiet for DESKTOP_SYNC_SETTLE seconds.
+watch_count() {
+    local feed="$1"
+    FEED="$feed" bash -c '
+        source "'"$DAEMON"'"
+        DESKTOP_SYNC_SETTLE=0.3
+        n=0
+        sync_desktop_default_sink() { n=$((n + 1)); }
+        desktop_sync_watch < <(eval "$FEED")
+        echo "$n"
+    ' 2>/dev/null
+}
+EV="Event '\''new'\'' on sink #"
+assert_eq "watch: no events -> no check" "$(watch_count 'true')" "0"
+assert_eq "watch: one burst of 5 new sinks -> one check" \
+    "$(watch_count "for i in 1 2 3 4 5; do echo \"$EV\$i\"; done")" "1"
+assert_eq "watch: two bursts 1 s apart -> two checks" \
+    "$(watch_count "echo \"${EV}1\"; echo \"${EV}2\"; command sleep 1; echo \"${EV}3\"")" "2"
+
+# The loop: subscribe to new-sink events only, re-check after resubscribing
+# (sinks re-created while pipewire-pulse restarted send no event to us).
+loop_body=$(sed -n '/^desktop_sync_loop()/,/^}/p' "$DAEMON" 2>/dev/null)
+if [[ "$loop_body" == *"pactl subscribe"* && "$loop_body" == *"'new' on sink #"* \
+      && "$loop_body" == *"sync_desktop_default_sink"* && "$loop_body" == *"desktop_sync_watch"* ]]; then
+    test_result "desktop_sync_loop watches new-sink events and re-checks on resubscribe" "pass"
+else
+    test_result "desktop_sync_loop watches new-sink events and re-checks on resubscribe" "fail"
+fi
+if sed -n '/^main()/,/^}/p' "$DAEMON" | grep -q 'desktop_sync_loop &' \
+   && sed -n '/^cleanup()/,/^}/p' "$DAEMON" | grep -q 'DESKTOP_SYNC_PID'; then
+    test_result "main starts desktop_sync_loop; cleanup stops it" "pass"
+else
+    test_result "main starts desktop_sync_loop; cleanup stops it" "fail"
+fi
+
+rm -rf "$SYNC_TMP"
+
+echo ""
+
 # --- Unit: Jabra mic probe ---
 echo "--- Unit: Jabra mic probe ---"
 

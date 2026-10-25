@@ -10,6 +10,7 @@ A PipeWire auto-routing and recovery daemon for Linux. Its jobs:
 2. **Jabra mic probe** — On each Jabra connect, listens to the mic for a few seconds in the background. The buds can relink delivering only exact digital zeros (mic dead, speaker fine; a full power-off plus a few minutes in the case clears it, a quick case-cycle often does not; see `JABRA-DEAD-MIC.md`). Pure zeros, confirmed by one retry, raise a critical desktop popup; the next healthy probe replaces it with "working again". The probe also unmutes the mic and forces `JABRA_SOURCE_VOLUME` (a muted or turned-down source delivers zeros too).
 3. **Jabra typing filter** — The bud mics pick up typing nearly as loud as speech. When the Jabra is active, the daemon loads DeepFilterNet (a speech-enhancement neural net, LADSPA build) as a virtual source fed by the raw mic, and makes that the default source. See "Jabra Typing Filter" below.
 4. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults based on the current priority resolution.
+5. **Desktop default-sink resync** — Cinnamon's volume keys (`csd-media-keys`) and sound applet keep their own copy of the default sink (libcvc), updated only by pipewire-pulse change events. When a re-created default sink comes back without one, the daemon re-announces it. See "Desktop Default-Sink Resync" below.
 
 ## Architecture
 
@@ -39,6 +40,12 @@ pipewire_health_loop() (background, every 30s; hunt mode every 10s)
   systemctl restart pipewire pipewire-pulse wireplumber
         ↓
   apply_priority()   (re-resolves ladder from per-device state)
+
+desktop_sync_loop() (background)
+        ↓
+  pactl subscribe | grep "'new' on sink #"  → desktop_sync_watch (one check per burst, 2 s quiet)
+        ↓
+  sync_desktop_default_sink()  same name, new index? → resync_desktop_default_sink()
 ```
 
 ### HID Detection
@@ -106,6 +113,23 @@ Constants:
 - `JABRA_DFN_LABEL` = `deep_filter_mono`.
 - `JABRA_DFN_CONTROLS` = `100,-15,35,35,0,0.02` — control ports in order: attenuation limit dB (100 = no limit), min / max-ERB / max-DF processing thresholds dB (plugin defaults), min processing buffer, post-filter beta (0.02 = the `deep-filter --pf` setting, which won the listening test over the default, a stronger post-filter, and 20/30 dB attenuation caps).
 
+### Desktop Default-Sink Resync
+
+Found 2026-10-25: the mouse volume buttons moved the Jabra sink while S/PDIF was the default. The daemon's routing was right; Cinnamon's cached copy was wrong.
+
+How it goes wrong:
+- During some screen locks every sound card disappears (the default becomes `auto_null`; cause unknown, nothing is logged, the logind session stays active).
+- At unlock all cards return at once. pipewire-pulse first reports the highest-priority sink (the Jabra) as default, then the configured one, and sometimes sends no change event for the second step. libcvc clients (`csd-media-keys`, the sound applet) stay on the Jabra. Seen twice on 2026-10-24; `~/.xsession-errors` shows `csd-media-keys: Unable to get default sink` at those moments.
+- `pactl set-default-sink <same name>` sends no event, so it does not help. Switching to a throwaway null sink and straight back does.
+
+How the daemon handles it:
+- `desktop_sync_loop` subscribes to pulse events, keeps only new-sink lines, and checks once per burst after `DESKTOP_SYNC_SETTLE` (2 s) of quiet. It also checks after every (re)subscribe, since a pipewire-pulse restart ends the subscription.
+- `sync_desktop_default_sink` compares the default's `"<name> <index>"` with `LAST_DEFAULT_SINK`. Same name with a new index means it was re-created, so it calls `resync_desktop_default_sink`. A changed name means a real event already went out. `auto_null`, the resync sink and an unlisted default are skipped, so the unlock compares against the sink from before the lock.
+- `resync_desktop_default_sink` loads `module-null-sink` named `DESKTOP_RESYNC_SINK` (`audio_switcher_resync`), makes it the default, restores the old sink only if the default is still the resync sink (a routing switch may have landed), and unloads it. Streams following the default hear a split second of silence.
+- Only the sink is handled. The default source could go stale the same way (it would affect the mic-mute key); not observed.
+
+To see which sink the volume keys drive: `gdbus call --session --dest org.cinnamon.SettingsDaemon.KeybindingHandler --object-path /org/cinnamon/SettingsDaemon/KeybindingHandler --method org.cinnamon.SettingsDaemon.KeybindingHandler.HandleKeybinding 5` (volume-down, quiet) then the same with `3`, comparing `pactl list sinks` volumes in between.
+
 ### PipeWire Recovery Constants
 
 | Constant | Value | Purpose |
@@ -146,6 +170,11 @@ Constants:
 | `check_pipewire_health()` | Count broken-pipe errors, restart PipeWire if threshold met, `apply_priority` |
 | `pipewire_health_loop()` | Background loop: sleep 30 (hunt: 10), check health, repeat |
 | `sleep_resume_loop()` | Re-apply defaults + hunt mode on wake from suspend |
+| `default_sink_identity()` | `"<name> <index>"` of the default sink (`""` if unlisted) |
+| `sync_desktop_default_sink()` | Same name + new index vs `LAST_DEFAULT_SINK` → resync; skips `auto_null` |
+| `resync_desktop_default_sink(sink)` | Null sink → default, back to `sink` (unless someone switched meanwhile), unload |
+| `desktop_sync_watch()` | Read new-sink event lines; one `sync_desktop_default_sink` per burst |
+| `desktop_sync_loop()` | Background: `pactl subscribe` → watch; re-check on every resubscribe |
 | `cleanup()` | Signal handler: stop probe, kill background jobs, remove runtime files |
 | `main()` | Arg parse + startup; guarded by `BASH_SOURCE`==`$0` so tests can source the daemon |
 
@@ -187,7 +216,7 @@ fi
 
 Categories:
 - **Static checks** — Script exists, executable, shebang, constants, functions (HID + recovery + state + Jabra + priority)
-- **Unit checks** — Source the daemon (guarded `main()`) and call functions directly: `resolve_active_device` truth table (jabra×btd combos), the `monitor_jabra_hidraw` parser (connect/disconnect/lookalike), the Jabra profile enforcer / sink lookup, and the typing filter (load / re-attach / fall back / unload) against a stubbed `pactl` shell function (define `pactl() { … }` after sourcing to fake PipeWire). Don't stub `log` where a function's stdout is captured as a value — that is how the typing filter's log-on-stdout bug hid.
+- **Unit checks** — Source the daemon (guarded `main()`) and call functions directly: `resolve_active_device` truth table (jabra×btd combos), the `monitor_jabra_hidraw` parser (connect/disconnect/lookalike), the Jabra profile enforcer / sink lookup, the typing filter (load / re-attach / fall back / unload), and the default-sink resync (re-created vs renamed vs `auto_null`, racing switch, burst debounce) against a stubbed `pactl` shell function (define `pactl() { … }` after sourcing to fake PipeWire). Don't stub `log` where a function's stdout is captured as a value — that is how the typing filter's log-on-stdout bug hid.
 - **Installation checks** — Binary installed, service file exists, enabled, active; both udev rules; DeepFilterNet plugin present
 - **Runtime checks** — Default sink/source matches the priority resolution (jabra → btd → S/PDIF; the Jabra source is `jabra_clean_mic` when the plugin is installed)
 
