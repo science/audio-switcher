@@ -90,83 +90,35 @@ else
     test_result "S/PDIF fallback sink constant present" "fail"
 fi
 
-# --- Jabra static checks ---
-# Jabra sink/source match pattern
-if grep -q 'JABRA_SINK_MATCH=.*Jabra_Link_390' "$DAEMON" 2>/dev/null; then
-    test_result "JABRA_SINK_MATCH pattern constant present" "pass"
+# --- Jabra support removed (2026-11-06) ---
+# The Jabra Evolve2 buds / Link 390 were retired; the daemon routes the
+# Sennheiser BTD-800 dongle only. No Jabra code, files or subcommands remain.
+if ! grep -qi 'jabra' "$DAEMON" 2>/dev/null; then
+    test_result "daemon has no Jabra code" "pass"
 else
-    test_result "JABRA_SINK_MATCH pattern constant present" "fail"
+    test_result "daemon has no Jabra code ($(grep -ci 'jabra' "$DAEMON") lines mention it)" "fail"
 fi
 
-# Jabra USB vendor id for hidraw discovery
-if grep -q 'JABRA_VID=.*0b0e' "$DAEMON" 2>/dev/null; then
-    test_result "JABRA_VID constant present" "pass"
+# The typing filter (DeepFilterNet LADSPA) and the mic probe were Jabra-only.
+if ! grep -qiE 'deep_?filter|ladspa|pw-record' "$DAEMON" 2>/dev/null; then
+    test_result "daemon has no typing filter or mic probe code" "pass"
 else
-    test_result "JABRA_VID constant present" "fail"
+    test_result "daemon has no typing filter or mic probe code" "fail"
 fi
 
-# Jabra HID report id constant
-if grep -q 'JABRA_HID_REPORT_ID=' "$DAEMON" 2>/dev/null; then
-    test_result "JABRA_HID_REPORT_ID constant present" "pass"
+if ! grep -q 'probe-mic' "$DAEMON" 2>/dev/null; then
+    test_result "probe-mic subcommand removed" "pass"
 else
-    test_result "JABRA_HID_REPORT_ID constant present" "fail"
+    test_result "probe-mic subcommand removed" "fail"
 fi
 
-# Jabra discovery + monitor + profile functions
-for func in find_jabra_hidraw find_jabra_sink find_jabra_source monitor_jabra_hidraw ensure_jabra_input_profile; do
-    if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
-        test_result "${func}() function defined" "pass"
+for f in 70-jabra.rules diag-jabra.sh JABRA-DEAD-MIC.md; do
+    if [[ ! -e "$PROJECT_DIR/$f" ]]; then
+        test_result "$f removed from the repo" "pass"
     else
-        test_result "${func}() function defined" "fail"
+        test_result "$f removed from the repo" "fail"
     fi
 done
-
-# --- Jabra mic probe static checks ---
-for const in JABRA_SOURCE_VOLUME JABRA_PROBE_DELAY JABRA_PROBE_SKIP JABRA_PROBE_LISTEN \
-             JABRA_PROBE_RETRY_DELAY JABRA_PROBE_MIN_NONZERO_PCT JABRA_PROBE_VOLUME_SETTLE \
-             JABRA_PROBE_ALERT_COOLDOWN JABRA_ALERT_COOLDOWN_FILE JABRA_ALERT_FLAG_FILE; do
-    if grep -q "^${const}=" "$DAEMON" 2>/dev/null; then
-        test_result "${const} constant present" "pass"
-    else
-        test_result "${const} constant present" "fail"
-    fi
-done
-
-for func in jabra_mic_verdict record_jabra_mic jabra_probe_source jabra_mic_state \
-            ensure_jabra_mic_live probe_jabra_mic_once probe_jabra_mic \
-            start_jabra_probe stop_jabra_probe do_probe_mic; do
-    if grep -q "^${func}()" "$DAEMON" 2>/dev/null; then
-        test_result "${func}() function defined" "pass"
-    else
-        test_result "${func}() function defined" "fail"
-    fi
-done
-
-# handle_event starts a probe on Jabra connect and cancels it on disconnect
-if sed -n '/^handle_event()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'start_jabra_probe'; then
-    test_result "handle_event starts the mic probe on Jabra connect" "pass"
-else
-    test_result "handle_event starts the mic probe on Jabra connect" "fail"
-fi
-if sed -n '/^handle_event()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'stop_jabra_probe'; then
-    test_result "handle_event cancels the mic probe on Jabra disconnect" "pass"
-else
-    test_result "handle_event cancels the mic probe on Jabra disconnect" "fail"
-fi
-
-# probe-mic subcommand
-if grep -q 'probe-mic)' "$DAEMON" 2>/dev/null; then
-    test_result "probe-mic subcommand handled in argument parsing" "pass"
-else
-    test_result "probe-mic subcommand handled in argument parsing" "fail"
-fi
-
-# cleanup removes the mic-alert runtime files
-if grep 'rm -f' "$DAEMON" 2>/dev/null | grep -q 'JABRA_ALERT_FLAG_FILE'; then
-    test_result "cleanup removes JABRA_ALERT_FLAG_FILE" "pass"
-else
-    test_result "cleanup removes JABRA_ALERT_FLAG_FILE" "fail"
-fi
 
 # --- Priority routing functions ---
 for func in resolve_active_device apply_priority apply_spdif_sink set_device_state get_device_state; do
@@ -327,27 +279,20 @@ else
     test_result "install.sh supports --uninstall" "fail"
 fi
 
-# install.sh installs the Jabra udev rule
-if grep -q '70-jabra.rules' "$INSTALL_SCRIPT" 2>/dev/null; then
-    test_result "install.sh references 70-jabra.rules" "pass"
+# install.sh no longer installs the Jabra udev rule or downloads DeepFilterNet
+if ! grep -qiE 'jabra|deep_?filter|DFN_' "$INSTALL_SCRIPT" 2>/dev/null; then
+    test_result "install.sh has no Jabra udev rule or DeepFilterNet download" "pass"
 else
-    test_result "install.sh references 70-jabra.rules" "fail"
+    test_result "install.sh has no Jabra udev rule or DeepFilterNet download" "fail"
 fi
 
-# install.sh fetches the pinned DeepFilterNet LADSPA plugin and checks its hash
-if grep -q 'libdeep_filter_ladspa-0.5.6-x86_64-unknown-linux-gnu.so' "$INSTALL_SCRIPT" 2>/dev/null \
-   && grep -q '2ca3205c2911d389604a826a240e745597d50252b5cab81c8248252b335e2236' "$INSTALL_SCRIPT" 2>/dev/null; then
-    test_result "install.sh installs the pinned DeepFilterNet plugin (sha256-checked)" "pass"
+# The BTD-800 udev rule is still installed
+if grep -q '70-btd800.rules' "$INSTALL_SCRIPT" 2>/dev/null; then
+    test_result "install.sh references 70-btd800.rules" "pass"
 else
-    test_result "install.sh installs the pinned DeepFilterNet plugin (sha256-checked)" "fail"
+    test_result "install.sh references 70-btd800.rules" "fail"
 fi
 
-# Jabra udev rule file exists and grants hidraw access for vid 0b0e
-if [[ -f "$PROJECT_DIR/70-jabra.rules" ]] && grep -q '0b0e' "$PROJECT_DIR/70-jabra.rules" 2>/dev/null; then
-    test_result "70-jabra.rules exists and matches vid 0b0e" "pass"
-else
-    test_result "70-jabra.rules exists and matches vid 0b0e" "fail"
-fi
 
 # uninstall.sh exists and is executable
 if [[ -f "$UNINSTALL_SCRIPT" && -x "$UNINSTALL_SCRIPT" ]]; then
@@ -358,271 +303,135 @@ fi
 
 echo ""
 
-# --- Unit: priority resolver truth table ---
+# --- Unit: active-device resolver ---
 echo "--- Unit: resolve_active_device ---"
 
-# resolve_for <jabra-state> <btd-state> -> echoes resolved device
-resolve_for() {
+# resolve_with <state-file-contents> -> echoes the resolved device
+resolve_with() {
     local tmp
     tmp=$(mktemp)
-    printf 'jabra=%s\nbtd=%s\n' "$1" "$2" > "$tmp"
+    printf '%b' "$1" > "$tmp"
     STATE_FILE="$tmp" bash -c "source '$DAEMON'; resolve_active_device" 2>/dev/null
     rm -f "$tmp"
 }
 
-assert_eq "Jabra wins when both connected"          "$(resolve_for connected connected)"       "jabra"
-assert_eq "Jabra wins when only Jabra connected"    "$(resolve_for connected disconnected)"    "jabra"
-assert_eq "BTD wins when only BTD connected"        "$(resolve_for disconnected connected)"    "btd"
-assert_eq "none when neither connected"             "$(resolve_for disconnected disconnected)" "none"
+assert_eq "btd when the headset is linked"          "$(resolve_with 'btd=connected\n')"    "btd"
+assert_eq "none when the headset is not linked"     "$(resolve_with 'btd=disconnected\n')" "none"
+assert_eq "none when the state file is empty"       "$(resolve_with '')"                   "none"
+# A state file written by the old Jabra-era daemon (it lives in
+# $XDG_RUNTIME_DIR, so it survives a service restart until logout).
+assert_eq "stale jabra=connected line is ignored"   "$(resolve_with 'jabra=connected\nbtd=disconnected\n')" "none"
+assert_eq "stale jabra line + linked BTD -> btd"    "$(resolve_with 'jabra=connected\nbtd=connected\n')"    "btd"
 
 echo ""
 
-# --- Unit: Jabra HID parser ---
-echo "--- Unit: monitor_jabra_hidraw parser ---"
+# --- Unit: BTD-800 HID parser ---
+# Report ID 1; byte 19 (0-indexed, counting the report-id byte) is the link flag.
+echo "--- Unit: monitor_hidraw parser ---"
 
-# jabra_parse <hex> -> runs the parser against a one-report binary file
-jabra_parse() {
+# btd_report <report-id> <flag-byte> -> hex of a 32-byte report
+btd_report() {
+    python3 -c "
+r = bytearray(32); r[0] = $1; r[19] = $2
+print(r.hex())"
+}
+# btd_parse <hex> -> runs the parser against a one-report binary file
+btd_parse() {
     local tmp
     tmp=$(mktemp)
     python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex('$1'))" > "$tmp"
-    STATE_FILE=/dev/null bash -c "source '$DAEMON'; monitor_jabra_hidraw '$tmp'" 2>/dev/null
+    STATE_FILE=/dev/null bash -c "source '$DAEMON'; monitor_hidraw '$tmp'" 2>/dev/null
     rm -f "$tmp"
 }
 
-# Confirmed signatures: header 05 00 01 00 08 0d, byte[6] 01=connect / 02=disconnect
-assert_eq "parser: 08 0d 01 -> connected"      "$(jabra_parse 05000100080d01010402)" "connected"
-assert_eq "parser: 08 0d 02 -> disconnected"   "$(jabra_parse 05000100080d02010402)" "disconnected"
-# Lookalike report (byte2=04, '05 00 04 ..') must NOT match
-assert_eq "parser: 05 00 04 lookalike ignored" "$(jabra_parse 05000451080d010a0900)" ""
+assert_eq "parser: report 1, byte 19 = 01 -> connected"    "$(btd_parse "$(btd_report 1 1)")" "connected"
+assert_eq "parser: report 1, byte 19 = 00 -> disconnected" "$(btd_parse "$(btd_report 1 0)")" "disconnected"
+assert_eq "parser: other report id ignored"                "$(btd_parse "$(btd_report 2 1)")" ""
+assert_eq "parser: report too short ignored"               "$(btd_parse "0101")"              ""
 
 echo ""
 
-# --- Unit: Jabra card profile enforcement ---
-# The Link 390 exposes both an "iec958" (digital passthrough) and an
-# "analog-stereo" output. WirePlumber picks iec958 by priority, which is
-# SILENT on the buds. The daemon must force the analog+mic profile on connect.
-echo "--- Unit: ensure_jabra_input_profile ---"
-
-JABRA_WANT_PROFILE="output:analog-stereo+input:mono-fallback"
-JABRA_TEST_CARD="alsa_card.usb-_Jabra_Link_390_6CFBED6C99AB2-00"
-
-if grep -q "JABRA_PROFILE=\"$JABRA_WANT_PROFILE\"" "$DAEMON" 2>/dev/null; then
-    test_result "JABRA_PROFILE constant is analog-stereo + mono input" "pass"
+# --- Unit: event_loop with an unreadable dongle ---
+# Without the udev rule the hidraw node is root-only. The loop must say so and
+# back off, not restart the monitor (4 log lines) every 2 seconds.
+echo "--- Unit: event_loop permission check ---"
+perm_run() {
+    local run
+    run=$(mktemp -d)
+    : > "$run/hidraw"; chmod 000 "$run/hidraw"
+    STATE_FILE=/dev/null HIDRAW="$run/hidraw" RUN="$run" timeout 5 bash -c '
+        source "'"$DAEMON"'"
+        find_hidraw() { echo "$HIDRAW"; }
+        monitor_hidraw() { echo started >> "$RUN/monitor"; }
+        show_status() { :; }
+        n=0
+        sleep() { n=$((n + 1)); echo "$1" >> "$RUN/sleeps"; (( n < 2 )) || exit 0; }
+        event_loop
+    ' > "$run/out" 2>/dev/null
+    echo "$(cat "$run/monitor" 2>/dev/null | wc -l)|$(head -1 "$run/sleeps" 2>/dev/null)|$(grep -c 'cannot read' "$run/out")"
+    chmod 600 "$run/hidraw"; rm -rf "$run"
+}
+if [[ $EUID -eq 0 ]]; then
+    test_result "event_loop permission check (skipped: root can read anything)" "pass"
 else
-    test_result "JABRA_PROFILE constant is analog-stereo + mono input" "fail"
-fi
-
-# jabra_profile_run <active-profile> -> echoes "<card> <profile>" for each
-# set-card-profile call the daemon issued against a stubbed pactl ("" if none)
-jabra_profile_run() {
-    local calls
-    calls=$(mktemp)
-    STATE_FILE=/dev/null CALLS="$calls" ACTIVE="$1" CARD="$JABRA_TEST_CARD" bash -c '
-        source "'"$DAEMON"'"
-        pactl() {
-            case "$1 $2 ${3:-}" in
-                "list cards short")   printf "99\t%s\talsa\n" "$CARD" ;;
-                "list cards ")        printf "Card #99\n\tName: %s\n\tActive Profile: %s\n\n" "$CARD" "$ACTIVE" ;;
-                "set-card-profile "*) echo "$2 $3" >> "$CALLS" ;;
-            esac
-        }
-        ensure_jabra_input_profile >/dev/null
-    ' 2>/dev/null
-    cat "$calls"
-    rm -f "$calls"
-}
-
-assert_eq "profile: iec958+input is switched to analog+input" \
-    "$(jabra_profile_run 'output:iec958-stereo+input:mono-fallback')" \
-    "$JABRA_TEST_CARD $JABRA_WANT_PROFILE"
-assert_eq "profile: analog output-only is switched to analog+input" \
-    "$(jabra_profile_run 'output:analog-stereo')" \
-    "$JABRA_TEST_CARD $JABRA_WANT_PROFILE"
-assert_eq "profile: analog+input left alone" \
-    "$(jabra_profile_run "$JABRA_WANT_PROFILE")" \
-    ""
-
-# find_jabra_sink prefers the analog sink when PipeWire still lists both
-# (transiently true right after a profile switch).
-jabra_sink_pick() {
-    STATE_FILE=/dev/null bash -c '
-        source "'"$DAEMON"'"
-        pactl() {
-            printf "1\talsa_output.usb-_Jabra_Link_390_X-00.iec958-stereo\tPipeWire\n"
-            printf "2\talsa_output.usb-_Jabra_Link_390_X-00.analog-stereo\tPipeWire\n"
-        }
-        find_jabra_sink
-    ' 2>/dev/null
-}
-assert_eq "find_jabra_sink prefers analog-stereo over iec958" \
-    "$(jabra_sink_pick)" "alsa_output.usb-_Jabra_Link_390_X-00.analog-stereo"
-
-# wait_for_jabra_sink polls until the (re-created) sink appears.
-jabra_sink_wait() {
-    local counter
-    counter=$(mktemp)
-    echo 0 > "$counter"
-    STATE_FILE=/dev/null COUNTER="$counter" bash -c '
-        source "'"$DAEMON"'"
-        pactl() {
-            local n; n=$(cat "$COUNTER"); echo $((n+1)) > "$COUNTER"
-            (( n >= 2 )) && printf "2\talsa_output.usb-_Jabra_Link_390_X-00.analog-stereo\tPipeWire\n"
-            return 0
-        }
-        wait_for_jabra_sink
-    ' 2>/dev/null
-    rm -f "$counter"
-}
-assert_eq "wait_for_jabra_sink returns sink once it appears" \
-    "$(jabra_sink_wait)" "alsa_output.usb-_Jabra_Link_390_X-00.analog-stereo"
-
-# apply_priority must use the waiting lookup in the jabra branch (the profile
-# switch re-creates the sink, so an immediate lookup can miss it).
-if sed -n '/^apply_priority()/,/^}/p' "$DAEMON" 2>/dev/null | grep -q 'wait_for_jabra_sink'; then
-    test_result "apply_priority waits for the Jabra sink after profile switch" "pass"
-else
-    test_result "apply_priority waits for the Jabra sink after profile switch" "fail"
+    assert_eq "event_loop: unreadable hidraw -> no monitor, 10 s back-off, one log line per try" \
+        "$(perm_run)" "0|10|2"
 fi
 
 echo ""
 
-# --- Unit: Jabra typing filter (DeepFilterNet virtual mic) ---
-# The buds' mic picks up typing loudly. The daemon loads DeepFilterNet's LADSPA
-# plugin as a virtual source fed by the raw Jabra mic and makes THAT the default
-# source; the dead-mic probe keeps listening to the raw mic.
-echo "--- Unit: Jabra typing filter ---"
+# --- Unit: routing (apply_priority) ---
+echo "--- Unit: apply_priority ---"
 
-for const in JABRA_CLEAN_SOURCE JABRA_DFN_PLUGIN JABRA_DFN_LABEL JABRA_DFN_CONTROLS; do
-    if grep -q "^${const}=" "$DAEMON" 2>/dev/null; then
-        test_result "${const} constant present" "pass"
-    else
-        test_result "${const} constant present" "fail"
-    fi
-done
-# Post-filter on (beta 0.02 = deep-filter --pf), thresholds at plugin defaults.
-if grep -q '^JABRA_DFN_CONTROLS="100,-15,35,35,0,0.02"' "$DAEMON" 2>/dev/null; then
-    test_result "JABRA_DFN_CONTROLS: full attenuation + post-filter 0.02" "pass"
-else
-    test_result "JABRA_DFN_CONTROLS: full attenuation + post-filter 0.02" "fail"
-fi
+ROUTE_TMP=$(mktemp -d)
+BTD_SINK_NAME="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.iec958-stereo"
+BTD_SRC_NAME="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
+SPDIF_NAME="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 
-FILTER_TMP=$(mktemp -d)
-: > "$FILTER_TMP/plugin.so"
-JRAW="alsa_input.usb-_Jabra_Link_390_X-00.mono-fallback"
-
-# filter_harness <command> — runs <command> in the sourced daemon against a
-# stubbed pactl. Inputs (env): LOADED=1 filter module already loaded
-#   SO_SRC  source id the filter's capture stream is attached to (raw = 7)
-#   NORAW=1 no raw Jabra source (dongle unplugged)   NOPLUGIN=1 plugin missing
-#   JSTATE  jabra state in the state file (default disconnected)
-# Outputs in $FILTER_TMP/run: calls (pactl load/unload/move/set-*), out (stdout), rc
-filter_harness() {
-    local run="$FILTER_TMP/run"
+# route_harness <btd-state> -> runs apply_priority against a stubbed pactl.
+# Inputs (env): DEF_SINK / DEF_SRC current defaults; PROFILE BTD card profile.
+# Outputs in $ROUTE_TMP/run: calls (pactl set-*), out (stdout)
+route_harness() {
+    local run="$ROUTE_TMP/run"
     rm -rf "$run"; mkdir -p "$run"
-    [[ -n "${LOADED:-}" ]] && touch "$run/loaded"
-    printf 'jabra=%s\nbtd=disconnected\n' "${JSTATE:-disconnected}" > "$run/state"
-    local plugin="$FILTER_TMP/plugin.so"
-    [[ -n "${NOPLUGIN:-}" ]] && plugin="$FILTER_TMP/missing.so"
-    STATE_FILE="$run/state" XDG_RUNTIME_DIR="$run" RUN="$run" PLUGIN="$plugin" \
-    SO_SRC="${SO_SRC:-7}" NORAW="${NORAW:-}" CMD="$1" bash -c '
+    printf 'btd=%s\n' "$1" > "$run/state"
+    STATE_FILE="$run/state" RUN="$run" DEF_SINK="${DEF_SINK:-$SPDIF_NAME}" \
+    DEF_SRC="${DEF_SRC:-other-mic}" PROFILE="${PROFILE:-output:iec958-stereo+input:mono-fallback}" \
+    BTD_SINK_NAME="$BTD_SINK_NAME" BTD_SRC_NAME="$BTD_SRC_NAME" SPDIF_NAME="$SPDIF_NAME" bash -c '
         source "'"$DAEMON"'"
-        JABRA_DFN_PLUGIN="$PLUGIN"
         sleep() { :; }
-        # log is NOT stubbed: the clean source name is captured by $(...), so
-        # a log line on stdout would corrupt it.
         pactl() {
             case "$1 ${2:-} ${3:-}" in
-                "list sources short")
-                    [[ -f "$RUN/loaded" ]] && printf "9\tjabra_clean_mic\tPipeWire\tfloat32le 1ch 48000Hz\tSUSPENDED\n"
-                    [[ -n "$NORAW" ]] || printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\ts16le 1ch 48000Hz\tRUNNING\n" ;;
-                "list sinks short")
-                    [[ -n "$NORAW" ]] || printf "6\talsa_output.usb-_Jabra_Link_390_X-00.analog-stereo\tPipeWire\n" ;;
-                "list modules short")
-                    [[ -f "$RUN/loaded" ]] && printf "536870913\tmodule-ladspa-source\tsource_name=jabra_clean_mic master=x\t\n" ;;
-                "list source-outputs "*)
-                    [[ -f "$RUN/loaded" ]] && printf "Source Output #50\n\tOwner Module: n/a\n\tSource: 7\n\nSource Output #51\n\tOwner Module: 536870913\n\tSource: %s\n\n" "$SO_SRC" ;;
-                "get-default-sink "*)   echo "other-sink" ;;
-                "get-default-source "*) echo "other-source" ;;
-                "load-module "*)   echo "$*" >> "$RUN/calls"; touch "$RUN/loaded"; echo 536870913 ;;
-                "unload-module "*) echo "$*" >> "$RUN/calls"; rm -f "$RUN/loaded" ;;
-                move-*|set-*)      echo "$*" >> "$RUN/calls" ;;
+                "list sinks short")   printf "25\t%s\n47\t%s\n" "$SPDIF_NAME" "$BTD_SINK_NAME" ;;
+                "list sources short") printf "47\t%s.monitor\n48\t%s\n" "$BTD_SINK_NAME" "$BTD_SRC_NAME" ;;
+                "list cards ")        printf "Card #41\n\tName: alsa_card.usb-1395_Sennheiser_BTD_800_USB-00\n\tActive Profile: %s\n\n" "$PROFILE" ;;
+                "get-default-sink  ")   echo "$DEF_SINK" ;;
+                "get-default-source  ") echo "$DEF_SRC" ;;
+                set-*)                echo "$*" >> "$RUN/calls" ;;
             esac
             return 0
         }
-        eval "$CMD"
+        apply_priority
     ' > "$run/out" 2>/dev/null
-    echo $? > "$run/rc"
     touch "$run/calls"
 }
-F="$FILTER_TMP/run"
+R="$ROUTE_TMP/run"
 
-# Not loaded yet -> one module-ladspa-source on the raw mic, mono, our controls.
-filter_harness "ensure_jabra_clean_source $JRAW"
-assert_eq "filter: not loaded -> prints the clean source name" "$(cat "$F/out")" "jabra_clean_mic"
-assert_eq "filter: not loaded -> exactly one load-module" "$(grep -c '^load-module' "$F/calls")" "1"
-load_call=$(grep '^load-module' "$F/calls" || true)
-for want in "module-ladspa-source" "source_name=jabra_clean_mic" "master=$JRAW" \
-            "label=deep_filter_mono" "control=100,-15,35,35,0,0.02" "channels=1" \
-            "plugin=$FILTER_TMP/plugin.so" \
-            "source_properties=\"device.description='Jabra buds mic (typing filtered)'\""; do
-    if [[ "$load_call" == *"$want"* ]]; then
-        test_result "filter: load-module carries $want" "pass"
-    else
-        test_result "filter: load-module carries $want (got: $load_call)" "fail"
-    fi
-done
+route_harness connected
+assert_eq "apply_priority (btd): matched BTD sink + mic set as defaults" "$(cat "$R/calls")" \
+    "$(printf 'set-default-sink %s\nset-default-source %s' "$BTD_SINK_NAME" "$BTD_SRC_NAME")"
 
-# Plugin not installed -> no load, non-zero status (caller falls back to raw).
-NOPLUGIN=1 filter_harness "ensure_jabra_clean_source $JRAW"
-assert_eq "filter: plugin missing -> no pactl calls" "$(cat "$F/calls")" ""
-assert_eq "filter: plugin missing -> non-zero status, no name" "$(cat "$F/rc")|$(cat "$F/out")" "1|"
+DEF_SINK="$BTD_SINK_NAME" DEF_SRC="$BTD_SRC_NAME" route_harness connected
+assert_eq "apply_priority (btd): already the defaults -> no calls" "$(cat "$R/calls")" ""
 
-# Already loaded and fed by the raw mic -> nothing to do.
-LOADED=1 SO_SRC=7 filter_harness "ensure_jabra_clean_source $JRAW"
-assert_eq "filter: loaded + attached to raw mic -> no calls" "$(cat "$F/calls")" ""
-assert_eq "filter: loaded -> prints the clean source name" "$(cat "$F/out")" "jabra_clean_mic"
+PROFILE="output:iec958-stereo" DEF_SINK="$BTD_SINK_NAME" DEF_SRC="$BTD_SRC_NAME" route_harness connected
+assert_eq "apply_priority (btd): output-only profile -> mic input added" "$(cat "$R/calls")" \
+    "set-card-profile alsa_card.usb-1395_Sennheiser_BTD_800_USB-00 output:iec958-stereo+input:mono-fallback"
 
-# Loaded but its capture stream drifted to another source (a profile switch
-# re-creates the raw mic under a new name) -> move it back, don't reload.
-LOADED=1 SO_SRC=12 filter_harness "ensure_jabra_clean_source $JRAW"
-assert_eq "filter: capture stream on wrong source -> moved back to raw mic" \
-    "$(cat "$F/calls")" "move-source-output 51 $JRAW"
+DEF_SINK="$BTD_SINK_NAME" route_harness disconnected
+assert_eq "apply_priority (none): S/PDIF sink, source left alone" "$(cat "$R/calls")" "set-default-sink $SPDIF_NAME"
 
-# The raw-mic lookup must never return the virtual source.
-LOADED=1 filter_harness "find_jabra_source"
-assert_eq "find_jabra_source ignores the filtered source" "$(cat "$F/out")" "$JRAW"
-
-# Routing: Jabra active -> default source is the filtered mic.
-JSTATE=connected filter_harness "apply_priority"
-if grep -qx "set-default-source jabra_clean_mic" "$F/calls"; then
-    test_result "apply_priority (jabra): default source = filtered mic" "pass"
-else
-    test_result "apply_priority (jabra): default source = filtered mic ($(tr '\n' ';' < "$F/calls"))" "fail"
-fi
-JSTATE=connected NOPLUGIN=1 filter_harness "apply_priority"
-if grep -qx "set-default-source $JRAW" "$F/calls"; then
-    test_result "apply_priority (jabra, no plugin): default source = raw mic" "pass"
-else
-    test_result "apply_priority (jabra, no plugin): default source = raw mic ($(tr '\n' ';' < "$F/calls"))" "fail"
-fi
-
-# Dongle unplugged -> drop the orphaned filter; dongle still present -> keep it
-# (apps recording from it keep their stream across a buds disconnect).
-LOADED=1 NORAW=1 filter_harness "apply_priority"
-assert_eq "apply_priority (none, dongle gone): filter unloaded" \
-    "$(grep '^unload-module' "$F/calls")" "unload-module 536870913"
-LOADED=1 filter_harness "apply_priority"
-assert_eq "apply_priority (none, dongle present): filter kept" "$(grep -c '^unload-module' "$F/calls")" "0"
-
-# Unplugging the dongle sends no HID event (the monitor just exits), so the
-# event loop must drop the orphaned filter itself.
-if sed -n '/^event_loop()/,/^}/p' "$DAEMON" 2>/dev/null | sed -n '/monitor(s) exited/,$p' | grep -q 'drop_jabra_clean_source'; then
-    test_result "event_loop drops the filter when a dongle's monitor exits and its mic is gone" "pass"
-else
-    test_result "event_loop drops the filter when a dongle's monitor exits and its mic is gone" "fail"
-fi
-
-rm -rf "$FILTER_TMP"
+rm -rf "$ROUTE_TMP"
 
 echo ""
 
@@ -644,14 +453,14 @@ done
 
 SYNC_TMP=$(mktemp -d)
 SPDIF="alsa_output.pci-0000_00_1f.3.iec958-stereo"
-JSINK="alsa_output.usb-_Jabra_Link_390_X-00.analog-stereo"
+JSINK="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.iec958-stereo"
 
 # sync_harness <command> — runs <command> in the sourced daemon against a
 # stubbed pactl. State lives in files the command may rewrite between calls:
 #   $RUN/default  server default sink name
 #   $RUN/sinks    "<index>\t<name>" lines (pactl list sinks short)
 # Inputs (env): DEF default sink name; SINKS printf-ready sinks list;
-#   STEAL=1 another writer moves the default to the Jabra while the resync
+#   STEAL=1 another writer moves the default to the headset while the resync
 #   sink is the default (a routing switch racing the resync).
 # Outputs in $SYNC_TMP/run: calls (pactl load/unload/set-*), out (stdout)
 sync_harness() {
@@ -795,241 +604,6 @@ rm -rf "$SYNC_TMP"
 
 echo ""
 
-# --- Unit: Jabra mic probe ---
-echo "--- Unit: Jabra mic probe ---"
-
-# Synthetic 48 kHz mono s16 recordings shaped like the real 2026-10-09 takes.
-PROBE_TMP=$(mktemp -d)
-python3 - "$PROBE_TMP" <<'PY'
-import array, math, random, sys, wave
-d, sr = sys.argv[1], 48000
-n = int(6.5 * sr)
-def write(name, samples):
-    w = wave.open(f"{d}/{name}.wav", "wb")
-    w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
-    w.writeframes(array.array("h", samples).tobytes())
-    w.close()
-random.seed(1)
-# Stuck bud: nothing but exact zeros.
-write("dead", [0] * n)
-# Stuck bud plus one 20 ms click (the hw mute switch flip seen in j2.wav).
-click = [0] * n
-for i in range(3 * sr, 3 * sr + sr // 50):
-    click[i] = 600 if i % 2 else -600
-write("click", click)
-# Working bud in a silent room: ~0.9 s of startup zeros, then a faint noise
-# floor of +/-3 with ~15% exact zeros scattered through it (w.wav shape).
-start = int(0.9 * sr)
-write("quiet", [0] * start + [random.choice((-3, -2, -1, 1, 2, 3)) if random.random() > 0.15 else 0
-                              for _ in range(n - start)])
-# Working bud, speaking: 1 s startup zeros, then a tone gated off every third 100 ms.
-write("speech", [0] * sr + [int(3000 * math.sin(2 * math.pi * 300 * i / sr)) if (i // 4800) % 3 else 0
-                            for i in range(n - sr)])
-# Too short to judge (1 s).
-write("short", [5] * sr)
-PY
-: > "$PROBE_TMP/empty.wav"
-
-# mic_verdict <wav> -> full verdict line from jabra_mic_verdict
-mic_verdict() {
-    STATE_FILE=/dev/null bash -c "source '$DAEMON'; jabra_mic_verdict '$1'" 2>/dev/null
-}
-
-assert_eq "verdict: all zeros -> dead"            "$(mic_verdict "$PROBE_TMP/dead.wav"   | awk '{print $1}')" "dead"
-assert_eq "verdict: zeros + one click -> dead"    "$(mic_verdict "$PROBE_TMP/click.wav"  | awk '{print $1}')" "dead"
-assert_eq "verdict: silent-room noise floor -> ok" "$(mic_verdict "$PROBE_TMP/quiet.wav" | awk '{print $1}')" "ok"
-assert_eq "verdict: gated speech -> ok"           "$(mic_verdict "$PROBE_TMP/speech.wav" | awk '{print $1}')" "ok"
-assert_eq "verdict: empty file -> inconclusive"   "$(mic_verdict "$PROBE_TMP/empty.wav"  | awk '{print $1}')" "inconclusive"
-assert_eq "verdict: 1 s file -> inconclusive"     "$(mic_verdict "$PROBE_TMP/short.wav"  | awk '{print $1}')" "inconclusive"
-assert_eq "verdict: missing file -> inconclusive" "$(mic_verdict "$PROBE_TMP/nope.wav"   | awk '{print $1}')" "inconclusive"
-if mic_verdict "$PROBE_TMP/quiet.wav" | grep -qE '^ok nonzero=[0-9.]+ rms=-?[0-9.inf]+ longest_zero=[0-9.]+ secs=[0-9.]+$'; then
-    test_result "verdict line carries nonzero/rms/longest_zero/secs stats" "pass"
-else
-    test_result "verdict line carries nonzero/rms/longest_zero/secs stats ($(mic_verdict "$PROBE_TMP/quiet.wav"))" "fail"
-fi
-
-# probe_harness <mode> — runs probe_jabra_mic (mode=probe) or do_probe_mic
-# (mode=subcommand) against stubbed pactl / recorder / notify / sleep / log.
-# Inputs (env): SEQ   space-separated recordings returned by successive takes
-#               MUTE  yes|no            SRCVOL  source volume line fragment
-#               SINKVOL_AFTER  raw sink volume after the first reading
-#               NOSRC=1  no Jabra source in PipeWire
-#               FLAG=<id>  an earlier dead alert is outstanding (notification id)
-#               COOLDOWN=1 a dead alert was sent just now
-# Outputs in $PROBE_TMP/run: calls (pactl set-*), notify, log, rec (take count), out (stdout)
-probe_harness() {
-    local run="$PROBE_TMP/run"
-    rm -rf "$run"; mkdir -p "$run/xdg"
-    [[ -n "${FLAG:-}" ]] && echo "$FLAG" > "$run/xdg/audio-switcher-mic-alert"
-    [[ -n "${COOLDOWN:-}" ]] && date +%s > "$run/xdg/audio-switcher-mic-alert-cooldown"
-    STATE_FILE=/dev/null XDG_RUNTIME_DIR="$run/xdg" RUN="$run" WAVS="$PROBE_TMP" MODE="$1" \
-    SEQ="${SEQ:-quiet}" MUTE="${MUTE:-no}" SRCVOL="${SRCVOL:-30802 /  47%}" \
-    SINKVOL_AFTER="${SINKVOL_AFTER:-29484}" NOSRC="${NOSRC:-}" CLEAN="${CLEAN:-}" bash -c '
-        source "'"$DAEMON"'"
-        sleep() { :; }
-        log() { echo "$*" >> "$RUN/log"; }
-        notify_user() { echo "$1|$2|${4:-}" >> "$RUN/notify"; }
-        notify_user_tracked() { echo "$1|$2|tracked" >> "$RUN/notify"; echo 777; }
-        record_jabra_mic() {
-            local n takes
-            n=$(cat "$RUN/rec" 2>/dev/null || echo 0); echo $((n + 1)) > "$RUN/rec"
-            echo "$1" >> "$RUN/recsrc"
-            read -ra takes <<< "$SEQ"
-            cp "$WAVS/${takes[n]:-dead}.wav" "$3"
-        }
-        pactl() {
-            local n v
-            case "$1" in
-                list) [[ -n "$CLEAN" ]] && printf "9\tjabra_clean_mic\tPipeWire\n"
-                      [[ -n "$NOSRC" ]] || printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\n" ;;
-                get-source-mute)   echo "Mute: $MUTE" ;;
-                get-source-volume) echo "Volume: mono: $SRCVOL / -19.69 dB" ;;
-                get-default-sink)  echo "jabra-sink" ;;
-                get-sink-volume)
-                    n=$(cat "$RUN/sv" 2>/dev/null || echo 0); echo $((n + 1)) > "$RUN/sv"
-                    if (( n == 0 )); then v=29484; else v=$SINKVOL_AFTER; fi
-                    echo "Volume: front-left: $v /  45% / -20.81 dB,   front-right: $v /  45% / -20.81 dB" ;;
-                get-sink-mute)     echo "Mute: no" ;;
-                set-*)             echo "$*" >> "$RUN/calls" ;;
-            esac
-            return 0
-        }
-        if [[ "$MODE" == subcommand ]]; then do_probe_mic; else probe_jabra_mic; fi
-    ' > "$run/out" 2>/dev/null
-    touch "$run/calls" "$run/notify" "$run/log" "$run/rec"
-}
-P="$PROBE_TMP/run"
-JSRC="alsa_input.usb-_Jabra_Link_390_X-00.mono-fallback"
-
-SEQ="dead dead" probe_harness probe
-assert_eq "probe: dead,dead -> one critical 'silent' alert" "$(cat "$P/notify")" "critical|Jabra mic is silent|tracked"
-assert_eq "probe: dead,dead -> alert flag holds notification id" "$(cat "$P/xdg/audio-switcher-mic-alert" 2>/dev/null)" "777"
-assert_eq "probe: dead,dead -> retried once (2 takes)" "$(cat "$P/rec")" "2"
-if grep -q '^PROBE: jabra mic dead nonzero=0.0' "$P/log"; then
-    test_result "probe: logs one PROBE line with the verdict stats" "pass"
-else
-    test_result "probe: logs one PROBE line with the verdict stats ($(cat "$P/log"))" "fail"
-fi
-
-SEQ="dead quiet" probe_harness probe
-assert_eq "probe: dead,ok -> no notification" "$(cat "$P/notify")" ""
-assert_eq "probe: dead,ok -> no alert flag" "$([[ -f "$P/xdg/audio-switcher-mic-alert" ]] && echo set)" ""
-
-SEQ="quiet" probe_harness probe
-assert_eq "probe: ok -> single take, no retry" "$(cat "$P/rec")" "1"
-assert_eq "probe: ok -> no notification" "$(cat "$P/notify")" ""
-
-SEQ="quiet" probe_harness probe
-if grep -qx "set-source-volume $JSRC 100%" "$P/calls"; then
-    test_result "probe: forces Jabra mic volume to JABRA_SOURCE_VOLUME (47% -> 100%)" "pass"
-else
-    test_result "probe: forces Jabra mic volume to JABRA_SOURCE_VOLUME ($(cat "$P/calls"))" "fail"
-fi
-SEQ="quiet" SRCVOL="65536 / 100%" probe_harness probe
-assert_eq "probe: mic already at 100% -> no volume change" "$(grep -c 'set-source-volume' "$P/calls")" "0"
-
-SEQ="quiet" MUTE=yes probe_harness probe
-if grep -qx "set-source-mute $JSRC 0" "$P/calls"; then
-    test_result "probe: muted mic is unmuted" "pass"
-else
-    test_result "probe: muted mic is unmuted ($(cat "$P/calls"))" "fail"
-fi
-assert_eq "probe: muted + ok -> one normal 'unmuted' notification" "$(cat "$P/notify")" "normal|Jabra mic unmuted|"
-
-# With the typing filter loaded, the probe still listens to the RAW mic (the
-# filter turns silence into exact zeros, which would read as a dead bud), but
-# a muted filtered mic is unmuted too: apps record from it.
-SEQ="quiet" MUTE=yes CLEAN=1 probe_harness probe
-assert_eq "probe: filter loaded -> still records the raw Jabra mic" "$(sort -u "$P/recsrc")" "$JSRC"
-if grep -qx "set-source-mute jabra_clean_mic 0" "$P/calls" && grep -qx "set-source-mute $JSRC 0" "$P/calls"; then
-    test_result "probe: filter loaded + muted -> raw AND filtered mic unmuted" "pass"
-else
-    test_result "probe: filter loaded + muted -> raw AND filtered mic unmuted ($(tr '\n' ';' < "$P/calls"))" "fail"
-fi
-assert_eq "probe: filter loaded + muted -> one 'unmuted' notification" "$(cat "$P/notify")" "normal|Jabra mic unmuted|"
-
-SEQ="dead dead" MUTE=yes probe_harness probe
-assert_eq "probe: muted + dead -> unmuted notice AND silent alert" "$(cat "$P/notify")" \
-    "$(printf 'normal|Jabra mic unmuted|\ncritical|Jabra mic is silent|tracked')"
-
-SEQ="quiet" FLAG=4242 probe_harness probe
-assert_eq "probe: ok after an alert -> 'working again' replaces it" "$(cat "$P/notify")" "normal|Jabra mic working again|4242"
-assert_eq "probe: ok after an alert -> flag cleared" "$([[ -f "$P/xdg/audio-switcher-mic-alert" ]] && echo set)" ""
-
-SEQ="dead dead" COOLDOWN=1 probe_harness probe
-assert_eq "probe: dead within alert cooldown -> no second popup" "$(cat "$P/notify")" ""
-
-NOSRC=1 probe_harness probe
-assert_eq "probe: no Jabra source -> nothing recorded" "$(cat "$P/rec")" ""
-assert_eq "probe: no Jabra source -> no notification" "$(cat "$P/notify")" ""
-
-SEQ="dead dead" SINKVOL_AFTER=20000 probe_harness probe
-assert_eq "probe: sink volume drift is restored to the snapshot" \
-    "$(grep 'set-sink-volume' "$P/calls")" "set-sink-volume jabra-sink 29484 29484"
-SEQ="quiet" probe_harness probe
-assert_eq "probe: unchanged sink volume -> no restore" "$(grep -c 'set-sink' "$P/calls")" "0"
-
-# probe-mic subcommand: report only, never change anything
-SEQ="quiet" MUTE=yes probe_harness subcommand
-assert_eq "probe-mic: muted mic -> reports muted" "$(awk '{print $1}' "$P/out")" "muted"
-assert_eq "probe-mic: muted mic -> no recording" "$(cat "$P/rec")" ""
-SEQ="quiet" probe_harness subcommand
-assert_eq "probe-mic: live mic -> prints verdict" "$(awk '{print $1}' "$P/out")" "ok"
-if grep -q 'vol=47%' "$P/out"; then
-    test_result "probe-mic: verdict line reports the mic volume" "pass"
-else
-    test_result "probe-mic: verdict line reports the mic volume ($(cat "$P/out"))" "fail"
-fi
-assert_eq "probe-mic: changes nothing (no pactl set-*)" "$(cat "$P/calls")" ""
-
-# stop_jabra_probe must end a running probe promptly (not after its current
-# sleep/recording finishes) and the probe's trap must still restore volume.
-probe_stop_run() {
-    local run="$PROBE_TMP/stop"
-    rm -rf "$run"; mkdir -p "$run/xdg"
-    STATE_FILE=/dev/null XDG_RUNTIME_DIR="$run/xdg" RUN="$run" bash -c '
-        source "'"$DAEMON"'"
-        JABRA_PROBE_DELAY=0
-        log() { :; }
-        notify_user() { :; }
-        record_jabra_mic() { command sleep 30; }
-        pactl() {
-            local n v
-            case "$1" in
-                list) printf "7\talsa_input.usb-_Jabra_Link_390_X-00.mono-fallback\tPipeWire\n" ;;
-                get-source-mute)   echo "Mute: no" ;;
-                get-source-volume) echo "Volume: mono: 65536 / 100% / 0.00 dB" ;;
-                get-default-sink)  echo "jabra-sink" ;;
-                get-sink-volume)
-                    n=$(cat "$RUN/sv" 2>/dev/null || echo 0); echo $((n + 1)) > "$RUN/sv"
-                    if (( n == 0 )); then v=29484; else v=20000; fi
-                    echo "Volume: front-left: $v /  45% / -20.81 dB,   front-right: $v /  45% / -20.81 dB" ;;
-                get-sink-mute)     echo "Mute: no" ;;
-                set-*)             echo "$*" >> "$RUN/calls" ;;
-            esac
-            return 0
-        }
-        start_jabra_probe
-        command sleep 1
-        t0=$SECONDS
-        stop_jabra_probe
-        wait 2>/dev/null || true
-        echo $(( SECONDS - t0 )) > "$RUN/elapsed"
-    ' 2>/dev/null
-}
-probe_stop_run
-if [[ -f "$PROBE_TMP/stop/elapsed" ]] && (( $(cat "$PROBE_TMP/stop/elapsed") <= 3 )); then
-    test_result "stop_jabra_probe ends a mid-recording probe promptly" "pass"
-else
-    test_result "stop_jabra_probe ends a mid-recording probe promptly (took $(cat "$PROBE_TMP/stop/elapsed" 2>/dev/null || echo '?')s)" "fail"
-fi
-assert_eq "stop_jabra_probe: killed probe still restores sink volume" \
-    "$(grep 'set-sink-volume' "$PROBE_TMP/stop/calls" 2>/dev/null)" "set-sink-volume jabra-sink 29484 29484"
-
-rm -rf "$PROBE_TMP"
-
-echo ""
-
 # --- Installation Checks ---
 echo "--- Installation Checks ---"
 
@@ -1064,17 +638,25 @@ else
     test_result "audio-switcher service is active" "fail"
 fi
 
-# Typing-filter plugin installed where the daemon looks for it
-DFN_PLUGIN="$HOME/.local/lib/audio-switcher/libdeep_filter_ladspa.so"
-if [[ -f "$DFN_PLUGIN" ]]; then
-    test_result "DeepFilterNet plugin installed (typing filter)" "pass"
+# BTD-800 udev rule installed
+if [[ -f /etc/udev/rules.d/70-btd800.rules ]]; then
+    test_result "BTD-800 udev rule installed" "pass"
 else
-    test_result "DeepFilterNet plugin installed (typing filter, missing: $DFN_PLUGIN)" "fail"
+    test_result "BTD-800 udev rule installed" "fail"
 fi
+
+# Leftovers from the Jabra era are gone from the machine
+for f in /etc/udev/rules.d/70-jabra.rules "$HOME/.local/lib/audio-switcher/libdeep_filter_ladspa.so"; do
+    if [[ ! -e "$f" ]]; then
+        test_result "Jabra-era leftover removed: $f" "pass"
+    else
+        test_result "Jabra-era leftover removed: $f" "fail"
+    fi
+done
 
 echo ""
 
-# --- Runtime Checks (priority model) ---
+# --- Runtime Checks ---
 echo "--- Runtime Checks ---"
 
 # pactl is available
@@ -1085,70 +667,40 @@ else
 fi
 
 BTD_USB_ID="usb-1395_Sennheiser_BTD_800_USB-00"
-JABRA_MATCH="Jabra_Link_390"
 SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 STATE_FILE="${XDG_RUNTIME_DIR}/audio-switcher-state"
 
-# Read a device's state from the daemon state file (default disconnected)
-rt_get_state() {
-    local d="$1" line=""
-    [[ -f "$STATE_FILE" ]] && line=$(grep "^${d}=" "$STATE_FILE" 2>/dev/null | tail -1)
-    if [[ -n "$line" ]]; then echo "${line#*=}"; else echo "disconnected"; fi
-}
-
-active="none"
-if [[ "$(rt_get_state jabra)" == "connected" ]]; then
-    active="jabra"
-elif [[ "$(rt_get_state btd)" == "connected" ]]; then
-    active="btd"
+# BTD state from the daemon state file (default disconnected)
+btd_state="disconnected"
+if [[ -f "$STATE_FILE" ]]; then
+    line=$(grep "^btd=" "$STATE_FILE" 2>/dev/null | tail -1)
+    [[ -n "$line" ]] && btd_state="${line#*=}"
 fi
 
 current_sink=$(pactl get-default-sink 2>/dev/null || true)
 current_source=$(pactl get-default-source 2>/dev/null || true)
 
-case "$active" in
-    jabra)
-        J_SINK=$(pactl list sinks short 2>/dev/null | grep "$JABRA_MATCH" | awk '{print $2}' | head -1)
-        # Apps get the typing-filtered virtual mic when the plugin is installed.
-        if [[ -f "$DFN_PLUGIN" ]]; then
-            J_SRC=$(pactl list sources short 2>/dev/null | awk '$2 == "jabra_clean_mic" {print $2}')
-        else
-            J_SRC=$(pactl list sources short 2>/dev/null | grep "$JABRA_MATCH" | grep -v '\.monitor' | awk '{print $2}' | head -1)
-        fi
-        if [[ -n "$J_SINK" && "$current_sink" == "$J_SINK" ]]; then
-            test_result "default sink is Jabra (buds connected)" "pass"
-        else
-            test_result "default sink is Jabra (buds connected, got: $current_sink, expected: ${J_SINK:-(not found)})" "fail"
-        fi
-        if [[ -n "$J_SRC" && "$current_source" == "$J_SRC" ]]; then
-            test_result "default source is Jabra mic (buds connected)" "pass"
-        else
-            test_result "default source is Jabra mic (buds connected, got: $current_source, expected: ${J_SRC:-(not found)})" "fail"
-        fi
-        ;;
-    btd)
-        BTD_SINK=$(pactl list sinks short 2>/dev/null | grep "$BTD_USB_ID" | awk '{print $2}' | head -1)
-        BTD_SOURCE=$(pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1)
-        if [[ -n "$BTD_SINK" && "$current_sink" == "$BTD_SINK" ]]; then
-            test_result "default sink is BTD-800 (headset connected)" "pass"
-        else
-            test_result "default sink is BTD-800 (headset connected, got: $current_sink, expected: ${BTD_SINK:-(not found)})" "fail"
-        fi
-        if [[ -n "$BTD_SOURCE" && "$current_source" == "$BTD_SOURCE" ]]; then
-            test_result "default source is BTD-800 mic (headset connected)" "pass"
-        else
-            test_result "default source is BTD-800 mic (headset connected, got: $current_source, expected: ${BTD_SOURCE:-(not found)})" "fail"
-        fi
-        ;;
-    none)
-        if [[ "$current_sink" == "$SPDIF_SINK" ]]; then
-            test_result "default sink is S/PDIF (no headset active)" "pass"
-        else
-            test_result "default sink is S/PDIF (no headset active, got: $current_sink)" "fail"
-        fi
-        test_result "no headset active — source check skipped (PipeWire chooses)" "pass"
-        ;;
-esac
+if [[ "$btd_state" == "connected" ]]; then
+    BTD_SINK=$(pactl list sinks short 2>/dev/null | grep "$BTD_USB_ID" | awk '{print $2}' | head -1)
+    BTD_SOURCE=$(pactl list sources short 2>/dev/null | grep "$BTD_USB_ID" | grep -v '\.monitor' | awk '{print $2}' | head -1)
+    if [[ -n "$BTD_SINK" && "$current_sink" == "$BTD_SINK" ]]; then
+        test_result "default sink is BTD-800 (headset connected)" "pass"
+    else
+        test_result "default sink is BTD-800 (headset connected, got: $current_sink, expected: ${BTD_SINK:-(not found)})" "fail"
+    fi
+    if [[ -n "$BTD_SOURCE" && "$current_source" == "$BTD_SOURCE" ]]; then
+        test_result "default source is BTD-800 mic (headset connected)" "pass"
+    else
+        test_result "default source is BTD-800 mic (headset connected, got: $current_source, expected: ${BTD_SOURCE:-(not found)})" "fail"
+    fi
+else
+    if [[ "$current_sink" == "$SPDIF_SINK" ]]; then
+        test_result "default sink is S/PDIF (headset not connected)" "pass"
+    else
+        test_result "default sink is S/PDIF (headset not connected, got: $current_sink)" "fail"
+    fi
+    test_result "headset not connected — source check skipped (PipeWire chooses)" "pass"
+fi
 
 echo ""
 
