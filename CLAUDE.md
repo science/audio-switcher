@@ -4,7 +4,7 @@
 
 A PipeWire auto-routing and recovery daemon for Linux, built for Sennheiser/EPOS headsets on the BTD-800 USB Bluetooth dongle. Its jobs:
 
-1. **HID-based headset detection + routing** — Reads the vendor HID report from the BTD-800 dongle's hidraw device to detect headset link/unlink. Linked → default sink **and** source set to the headset (a matched pair — the OS/apps routinely mismatch headset speaker/mic on their own). Unlinked → default sink falls back to the S/PDIF speakers (sink only; no matching mic). A dongle merely being plugged in does *not* count — the headset must be linked to it.
+1. **HID-based headset detection + routing** — Reads the vendor HID report from the BTD-800 dongle's hidraw device to detect headset link/unlink. Linked → default sink **and** source set to the headset (a matched pair — the OS/apps routinely mismatch headset speaker/mic on their own), and the headset mic volume reset to 100% (connect only; see `BTD_SOURCE_VOLUME`). Unlinked → default sink falls back to the S/PDIF speakers (sink only; no matching mic). A dongle merely being plugged in does *not* count — the headset must be linked to it.
 2. **PipeWire recovery** — Polls journalctl for broken-pipe errors and restarts PipeWire when a threshold is exceeded, then re-applies the correct audio defaults from the current headset state.
 3. **Desktop default-sink resync** — Cinnamon's volume keys (`csd-media-keys`) and sound applet keep their own copy of the default sink (libcvc), updated only by pipewire-pulse change events. When a re-created default sink comes back without one, the daemon re-announces it. See "Desktop Default-Sink Resync" below.
 
@@ -26,6 +26,7 @@ handle_event btd <state> → set_device_state → apply_priority
                          resolve_active_device = btd ──→ ensure_btd_input_profile,
                                                  │        set-default-sink AND -source (matched pair)
                                                  └ none ─→ apply_spdif_sink (sink only, with retry)
+                         on btd connect only, after apply_priority → ensure_btd_mic_volume (mic → 100%)
 
 pipewire_health_loop() (background, every 30s; hunt mode every 10s)
   → check_pipewire_health: journalctl broken-pipe count ≥ threshold?
@@ -63,6 +64,7 @@ Background subshells in bash can't share variables. The state file (`$XDG_RUNTIM
 - `BTD_USB_ID` = `usb-1395_Sennheiser_BTD_800_USB-00` — match pattern for the BTD-800 sink, source and card (stable across profile changes; the full sink/source names vary with the active profile, so they are discovered at runtime by `find_btd_sink` / `find_btd_source`).
 - `SPDIF_SINK` = `alsa_output.pci-0000_00_1f.3.iec958-stereo` — motherboard S/PDIF (stable).
 - `BTD_HID_REPORT_ID` = 1, `BTD_HID_CONNECT_BYTE` = 19.
+- `BTD_SOURCE_VOLUME` = `100%` — headset mic level set on every headset connect. Apps can lower the mic level during a call (browser WebRTC auto gain control does this) and WirePlumber remembers it, so the next call would start quiet. Applied on connect only, not on resume or PipeWire restart, so a level picked mid-call is kept until the next connect. (Added 2026-11-10. The Jabra-era daemon forced 100% on the Jabra mic as part of its dead-mic probe; that was never done for the BTD-800 and left with the probe in `94ba075`.)
 
 ### Desktop Default-Sink Resync
 
@@ -95,7 +97,8 @@ To see which sink the volume keys drive: `gdbus call --session --dest org.cinnam
 - `ensure_btd_input_profile()` — switch the BTD card to the `+input:mono-fallback` variant if the active profile is output-only.
 - `monitor_hidraw()` — read HID reports via embedded Python, emit `connected` / `disconnected`.
 - `event_loop()` — discover the dongle (wait if absent, back off if unreadable), monitor it, re-discover when the monitor exits.
-- `handle_event(device, state)` — update state, `apply_priority`, enter hunt mode on connect.
+- `handle_event(device, state)` — update state, `apply_priority`, on connect also `ensure_btd_mic_volume` and hunt mode.
+- `ensure_btd_mic_volume()` — set the BTD mic to `BTD_SOURCE_VOLUME` (logs changes only).
 - `set_device_state()` / `get_device_state()` / `resolve_active_device()` — state file IPC.
 - `apply_priority()` — `btd` → matched sink + source; `none` → S/PDIF sink.
 - `apply_sink_source()` — set a matched sink+source pair (logs changes only).
@@ -141,7 +144,7 @@ plus `assert_eq "Description" "$got" "$want"`.
 
 Categories:
 - **Static checks** — script exists, executable, shebang, strict mode, constants, functions; no Jabra code or files remain.
-- **Unit checks** — source the daemon (guarded `main()`) and call functions directly against a stubbed `pactl` shell function (define `pactl() { … }` after sourcing to fake PipeWire): `resolve_active_device`, the `monitor_hidraw` parser, `event_loop`'s permission back-off, `apply_priority` routing, and the default-sink resync (re-created vs renamed vs `auto_null`, racing switch, burst debounce). Don't stub `log` where a function's stdout is captured as a value.
+- **Unit checks** — source the daemon (guarded `main()`) and call functions directly against a stubbed `pactl` shell function (define `pactl() { … }` after sourcing to fake PipeWire): `resolve_active_device`, the `monitor_hidraw` parser, `event_loop`'s permission back-off, `apply_priority` routing, the connect-time mic volume reset, and the default-sink resync (re-created vs renamed vs `auto_null`, racing switch, burst debounce). Don't stub `log` where a function's stdout is captured as a value.
 - **Installation checks** — binary installed, service file exists, enabled, active; BTD-800 udev rule installed; no Jabra-era leftovers on the machine.
 - **Runtime checks** — default sink/source match the headset state (BTD-800 pair when linked, S/PDIF sink otherwise).
 

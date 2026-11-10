@@ -121,7 +121,7 @@ for f in 70-jabra.rules diag-jabra.sh JABRA-DEAD-MIC.md; do
 done
 
 # --- Priority routing functions ---
-for func in resolve_active_device apply_priority apply_spdif_sink set_device_state get_device_state; do
+for func in resolve_active_device apply_priority apply_spdif_sink set_device_state get_device_state ensure_btd_mic_volume; do
     if grep -q "${func}()" "$DAEMON" 2>/dev/null; then
         test_result "${func}() function defined" "pass"
     else
@@ -388,8 +388,10 @@ BTD_SINK_NAME="alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.iec958-stereo"
 BTD_SRC_NAME="alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback"
 SPDIF_NAME="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 
-# route_harness <btd-state> -> runs apply_priority against a stubbed pactl.
-# Inputs (env): DEF_SINK / DEF_SRC current defaults; PROFILE BTD card profile.
+# route_harness <btd-state> [command] -> runs <command> (default apply_priority)
+# against a stubbed pactl.
+# Inputs (env): DEF_SINK / DEF_SRC current defaults; PROFILE BTD card profile;
+#   SRC_VOL the BTD mic's current volume (pactl get-source-volume).
 # Outputs in $ROUTE_TMP/run: calls (pactl set-*), out (stdout)
 route_harness() {
     local run="$ROUTE_TMP/run"
@@ -397,6 +399,7 @@ route_harness() {
     printf 'btd=%s\n' "$1" > "$run/state"
     STATE_FILE="$run/state" RUN="$run" DEF_SINK="${DEF_SINK:-$SPDIF_NAME}" \
     DEF_SRC="${DEF_SRC:-other-mic}" PROFILE="${PROFILE:-output:iec958-stereo+input:mono-fallback}" \
+    SRC_VOL="${SRC_VOL:-100%}" CMD="${2:-apply_priority}" \
     BTD_SINK_NAME="$BTD_SINK_NAME" BTD_SRC_NAME="$BTD_SRC_NAME" SPDIF_NAME="$SPDIF_NAME" bash -c '
         source "'"$DAEMON"'"
         sleep() { :; }
@@ -407,11 +410,14 @@ route_harness() {
                 "list cards ")        printf "Card #41\n\tName: alsa_card.usb-1395_Sennheiser_BTD_800_USB-00\n\tActive Profile: %s\n\n" "$PROFILE" ;;
                 "get-default-sink  ")   echo "$DEF_SINK" ;;
                 "get-default-source  ") echo "$DEF_SRC" ;;
+                "get-source-volume $BTD_SRC_NAME ")
+                    echo "Volume: mono: 30802 / $SRC_VOL / -19.68 dB" ;;
                 set-*)                echo "$*" >> "$RUN/calls" ;;
             esac
             return 0
         }
-        apply_priority
+        PW_COOLDOWN_FILE="$RUN/cooldown"
+        $CMD
     ' > "$run/out" 2>/dev/null
     touch "$run/calls"
 }
@@ -430,6 +436,35 @@ assert_eq "apply_priority (btd): output-only profile -> mic input added" "$(cat 
 
 DEF_SINK="$BTD_SINK_NAME" route_harness disconnected
 assert_eq "apply_priority (none): S/PDIF sink, source left alone" "$(cat "$R/calls")" "set-default-sink $SPDIF_NAME"
+
+# Mic volume: forced to BTD_SOURCE_VOLUME when the headset links, so a level
+# lowered by an app (e.g. a browser's auto gain control) on an earlier call
+# does not carry over. Only on connect: apply_priority alone (resume, PipeWire
+# restart) leaves the volume alone; the exact-call asserts above cover that.
+DEF_SINK="$BTD_SINK_NAME" DEF_SRC="$BTD_SRC_NAME" SRC_VOL="47%" route_harness connected ensure_btd_mic_volume
+assert_eq "ensure_btd_mic_volume: 47% -> raised to 100%" "$(cat "$R/calls")" \
+    "set-source-volume $BTD_SRC_NAME 100%"
+if grep -q "MIC: BTD-800 mic volume 47% -> 100%" "$R/out"; then
+    test_result "ensure_btd_mic_volume: logs the change" "pass"
+else
+    test_result "ensure_btd_mic_volume: logs the change" "fail"
+fi
+
+DEF_SINK="$BTD_SINK_NAME" DEF_SRC="$BTD_SRC_NAME" SRC_VOL="100%" route_harness connected ensure_btd_mic_volume
+assert_eq "ensure_btd_mic_volume: already 100% -> no calls" "$(cat "$R/calls")" ""
+if [[ ! -s "$R/out" ]]; then
+    test_result "ensure_btd_mic_volume: already 100% -> logs nothing" "pass"
+else
+    test_result "ensure_btd_mic_volume: already 100% -> logs nothing" "fail"
+fi
+
+DEF_SINK="$BTD_SINK_NAME" DEF_SRC="$BTD_SRC_NAME" SRC_VOL="47%" route_harness disconnected "handle_event btd connected"
+assert_eq "handle_event btd connected: mic volume raised" "$(cat "$R/calls")" \
+    "set-source-volume $BTD_SRC_NAME 100%"
+
+DEF_SINK="$BTD_SINK_NAME" DEF_SRC="$BTD_SRC_NAME" SRC_VOL="47%" route_harness connected "handle_event btd disconnected"
+assert_eq "handle_event btd disconnected: mic volume untouched" "$(cat "$R/calls")" \
+    "set-default-sink $SPDIF_NAME"
 
 rm -rf "$ROUTE_TMP"
 

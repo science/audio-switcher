@@ -27,6 +27,11 @@ SPDIF_SINK="alsa_output.pci-0000_00_1f.3.iec958-stereo"
 BTD_HID_REPORT_ID=1
 BTD_HID_CONNECT_BYTE=19  # 0-indexed within full report (including report ID byte)
 
+# Mic input level forced each time the headset links. Apps can lower the mic
+# level during a call (browser WebRTC auto gain control does this) and
+# WirePlumber remembers it, so without a reset the next call starts quiet.
+BTD_SOURCE_VOLUME="100%"
+
 # PipeWire recovery: detect broken-pipe errors and restart PipeWire
 PW_ERROR_THRESHOLD=5         # broken-pipe errors in check window to trigger restart
 PW_CHECK_WINDOW="30s"        # how far back to look in the journal
@@ -192,6 +197,26 @@ resolve_active_device() {
 
 # --- Routing ---
 # Set default sink AND source to a matched pair, logging changes only.
+# ensure_btd_mic_volume: set the BTD-800 mic to BTD_SOURCE_VOLUME. Called on
+# headset connect only, so a level the user picks mid-call is kept until the
+# next connect. Logs only when it changes something.
+ensure_btd_mic_volume() {
+    local src line vol
+    src=$(find_btd_source)
+    [[ -n "$src" ]] || return 0   # apply_priority already warned
+    line=$(pactl get-source-volume "$src" 2>/dev/null || true)
+    [[ "$line" =~ ([0-9]+%) ]] && vol="${BASH_REMATCH[1]}" || vol=""
+    if [[ "$vol" == "$BTD_SOURCE_VOLUME" ]]; then
+        debug "BTD-800 mic volume already $vol"
+        return 0
+    fi
+    if pactl set-source-volume "$src" "$BTD_SOURCE_VOLUME" 2>/dev/null; then
+        log "MIC: BTD-800 mic volume ${vol:-?} -> $BTD_SOURCE_VOLUME"
+    else
+        log "WARNING: failed to set BTD-800 mic volume ($src)"
+    fi
+}
+
 apply_sink_source() {
     local label="$1" sink="$2" source="$3" cur_sink="$4" cur_source="$5"
 
@@ -471,6 +496,9 @@ handle_event() {
             sleep "$SETTLE_DELAY"
             set_device_state "$device" connected
             apply_priority
+            if [[ "$device" == btd ]]; then
+                ensure_btd_mic_volume
+            fi
             show_status
             # Newly connected devices are prone to broken pipes — enter hunt mode.
             log "HUNT: entering hunt mode after $device connect"

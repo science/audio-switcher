@@ -5,6 +5,7 @@ PipeWire auto-routing and recovery daemon for Linux. Built for Sennheiser (now E
 ## What It Does
 
 - **Headset detection via HID** — Reads vendor HID reports from the BTD-800 USB dongle to detect headset connect/disconnect. When the headset links, the daemon sets the PipeWire default **sink and source together** to the headset. When it unlinks, the default sink falls back to the S/PDIF speakers (which have no mic, so the default source is left to PipeWire). A dongle being plugged in does *not* count — the headset must be linked to it. Keeping sink and source matched is the point: the OS and apps routinely split a headset's speaker and mic onto different devices.
+- **Mic volume reset on connect** — Each time the headset links, its mic input volume is set to 100%. Apps can turn the mic down during a call (browsers' automatic gain control does this), and PipeWire remembers that level, so without the reset the next call would start quiet. It happens only on connect, so if you change the level during a call it stays until the next connect.
 - **PipeWire crash recovery** — Monitors journalctl for PipeWire broken-pipe errors. When a threshold is exceeded, restarts PipeWire and re-applies the correct audio defaults based on the current headset state. Enters "hunt mode" after connect and resume events for aggressive monitoring.
 - **Desktop notifications** — Sends a persistent (critical) desktop notification when PipeWire is restarted, warning that apps like Slack may need restarting. Cooldown-guarded to max one notification per 5 minutes.
 - **Sleep/resume recovery** — Monitors systemd-logind D-Bus signals for system wake events. On resume, re-applies audio defaults and enters hunt mode (PipeWire streams often break when USB devices lose power during suspend).
@@ -72,6 +73,7 @@ Example output:
 10:30:42: EVENT: btd connected
 10:30:42: SWITCH sink → BTD-800 headset (alsa_output.usb-1395_Sennheiser_BTD_800_USB-00.iec958-stereo)
 10:30:42: SWITCH source → BTD-800 headset (alsa_input.usb-1395_Sennheiser_BTD_800_USB-00.mono-fallback)
+10:30:42: MIC: BTD-800 mic volume 47% -> 100%
 10:45:01: PW-RECOVERY: 7 broken-pipe errors in last 30s, restarting PipeWire
 10:45:03: PW-RECOVERY: defaults re-applied (active=btd)
 10:48:10: EVENT: btd disconnected
